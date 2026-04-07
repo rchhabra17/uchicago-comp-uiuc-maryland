@@ -1,0 +1,77 @@
+INFO:xchange-client:Connecting to host 34.197.188.76:3333 as maryland_uiuc
+INFO:xchange-client:Received message of type authenticated. index 0
+INFO:xchange-client:Authenticated by exchange.
+INFO:xchange-client:Received message of type position_snapshot. index 1243023
+INFO:xchange-client:cash: 23991
+positions {
+  symbol: "A"
+  position: 0
+}
+positions {
+  symbol: "B"
+  position: -27
+}
+positions {
+  symbol: "B_C_1000"
+  position: 36
+}
+positions {
+  symbol: "B_C_1050"
+  position: 33
+}
+positions {
+  symbol: "B_C_950"
+  position: 15
+}
+positions {
+  symbol: "B_P_1000"
+  position: -24
+}
+positions {
+  symbol: "B_P_1050"
+  position: -24
+}
+positions {
+  symbol: "B_P_950"
+  position: 0
+}
+positions {
+  symbol: "C"
+  position: 0
+}
+positions {
+  symbol: "ETF"
+  position: 0
+}
+positions {
+  symbol: "R_CUT"
+  position: 0
+}
+positions {
+  symbol: "R_HIKE"
+  position: 0
+}
+positions {
+  symbol: "R_HOLD"
+  position: 0
+}
+
+INFO:xchange-client:Received Position snapshot from server
+INFO:xchange-client:defaultdict(<class 'int'>, {'A': 0, 'B': -27, 'B_C_1000': 36, 'B_C_1050': 33, 'B_C_950': 15, 'B_P_1000': -24, 'B_P_1050': -24, 'B_P_950': 0, 'C': 0, 'ETF': 0, 'R_CUT': 0, 'R_HIKE': 0, 'R_HOLD': 0, 'cash': 23991})
+[B PNL] cash=0 | pos_B=0 | C950=0 C1000=0 C1050=0 | P950=0 P1000=0 P1050=0 | mtm=0
+[B PNL] cash=0 | pos_B=0 | C950=0 C1000=0 C1050=0 | P950=0 P1000=0 P1050=0 | mtm=0
+[B PNL] cash=0 | pos_B=0 | C950=0 C1000=0 C1050=0 | P950=0 P1000=0 P1050=0 | mtm=0
+INFO:xchange-client:Received message of type news_event. index 1262252
+[EARNINGS] A: EPS=0.9027938878209404, calibrating... waiting for market to settle
+INFO:xchange-client:Received message of type news_event. index 1262253
+[B PNL] cash=0 | pos_B=0 | C950=0 C1000=0 C1050=0 | P950=0 P1000=0 P1050=0 | mtm=0
+[B PNL] cash=0 | pos_B=0 | C950=0 C1000=0 C1050=0 | P950=0 P1000=0 P1050=0 | mtm=0
+[CALIBRATE] PE_A = 1032.4 (from mid=932.0, eps=0.9027938878209404)
+[B PNL] cash=0 | pos_B=0 | C950=0 C1000=0 C1050=0 | P950=0 P1000=0 P1050=0 | mtm=0
+[B PNL] cash=0 | pos_B=0 | C950=0 C1000=0 C1050=0 | P950=0 P1000=0 P1050=0 | mtm=0
+[B PNL] cash=0 | pos_B=0 | C950=0 C1000=0 C1050=0 | P950=0 P1000=0 P1050=0 | mtm=0
+[B PNL] cash=0 | pos_B=0 | C950=0 C1000=0 C1050=0 | P950=0 P1000=0 P1050=0 | mtm=0
+INFO:xchange-client:Received message of type news_event. index 1300974
+[EARNINGS] A: EPS=0.941671211878926, fair=972.1350369235433, market_mid=902.0
+[B PNL] cash=0 | pos_B=0 | C950=0 C1000=0 C1050=0 | P950=0 P1000=0 P1050=0 | mtm=0
+[B PNL] cash=0 | pos_B=0 | C950=0 C1000=0 C1050=0 | P950=0 P1000=0 P1050=0 | mtm=0
