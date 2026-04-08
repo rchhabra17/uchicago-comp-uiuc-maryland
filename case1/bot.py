@@ -13,6 +13,7 @@ class MyXchangeClient(XChangeClient):
         self.fair_value = FairValueEngine()
         self.risk = RiskManager()
         self.pnl = 0
+        self.drift = {"A": 0.0, "C": 0.0}
 
 
     # DUMMY BOILERPLATE CODE
@@ -76,11 +77,40 @@ class MyXchangeClient(XChangeClient):
         size = config.PARAMS[symbol]["order_size"]
         pos = self.positions.get(symbol, 0)
 
-        # Skew: if long, push quotes down (cheaper ask to offload)
-        skew = -pos * 0.15  # tune this — at pos=30, skew = -4.5
+        # 1. SMART MONEY ADJUSTMENT (Drift)
+        book = self.order_books.get(symbol)
+        adjusted_fair = fair
+        if book and book.bids and book.asks:
+            bids = [k for k, v in book.bids.items() if v > 0]
+            asks = [k for k, v in book.asks.items() if v > 0]
+            if bids and asks:
+                market_mid = (max(bids) + min(asks)) / 2
+                disparity = market_mid - fair
+                
+                # If disparity is large, pull fair slowly towards market (rolling 95/5 EMA)
+                self.drift[symbol] = 0.95 * self.drift.get(symbol, 0.0) + 0.05 * disparity
+                adjusted_fair = fair + self.drift[symbol]
 
-        bid_price = int(fair + skew - spread)
-        ask_price = int(fair + skew + spread)
+        # 2. VOLATILITY / SPREAD EXPANSION
+        inventory_spread_expansion = int(abs(pos) * 0.1)  # Widen 1 tick per 10 units
+        effective_spread = spread + inventory_spread_expansion
+
+        # 3. SKEW AND ASYMMETRIC QUOTING / SQUELCH
+        skew_mult = config.PARAMS[symbol].get("skew_mult", 0.15)
+        skew = -pos * skew_mult
+
+        bid_price = int(adjusted_fair + skew - effective_spread)
+        ask_price = int(adjusted_fair + skew + effective_spread)
+
+        # Force squelch if inventory is highly critical (> 30 is 75% of max 40)
+        if pos >= 30:
+            # Too long: un-quote the bid entirely, sell very aggressively exactly at mid
+            bid_price = int(adjusted_fair - 1000)
+            ask_price = int(adjusted_fair - effective_spread / 2)
+        elif pos <= -30:
+            # Too short: un-quote the ask entirely, buy very aggressively exactly at mid
+            ask_price = int(adjusted_fair + 1000)
+            bid_price = int(adjusted_fair + effective_spread / 2)
 
         # Hard cutoffs — don't add to a big position
         if pos < 40 and self.risk.can_trade(symbol, "buy", size, config.MAX_POSITION):
@@ -173,9 +203,27 @@ class MyXchangeClient(XChangeClient):
                             if tick_in_day / 5 < 85:
                                 await self.quote_around("A", new_fair)
 
-            elif subtype == "cpi_print":
-                pass  # Phase 3
+                elif asset == "C":
+                    new_fair = self.fair_value.update_c(value)
+                    print(f"[EARNINGS] C: EPS={value}, fair={new_fair}")
+                    if new_fair is not None:
+                        await self.cancel_all_orders("C")
+                        await self.sweep_book("C", new_fair)
+                        tick_in_day = tick % 450
+                        if tick_in_day / 5 < 85:
+                            await self.quote_around("C", new_fair)
 
+            elif subtype == "cpi_print":
+                forecast = news_data.get("forecast")
+                actual = news_data.get("actual")
+                if forecast is not None and actual is not None:
+                    self.fair_value.fed.update_from_cpi(forecast, actual)
+                    new_fair_c = self.fair_value.recompute_c()
+                    print(f"[CPI PRINT] forecast={forecast}, actual={actual}, new_fair_C={new_fair_c}")
+                    if new_fair_c is not None:
+                        await self.cancel_all_orders("C")
+                        await self.sweep_book("C", new_fair_c)
+                        await self.quote_around("C", new_fair_c)
         else:
             pass  # unstructured news — Phase 3
 
@@ -188,6 +236,25 @@ class MyXchangeClient(XChangeClient):
     async def trade_loop(self):
         while True:
             await asyncio.sleep(5)
+
+            def get_mid_fuzzy(keyword):
+                for sym, book in self.order_books.items():
+                    if keyword.lower() in sym.lower():
+                        if book and book.bids and book.asks:
+                            bids = [k for k, v in book.bids.items() if v > 0]
+                            asks = [k for k, v in book.asks.items() if v > 0]
+                            if bids and asks:
+                                return (max(bids) + min(asks)) / 2
+                return None
+
+            hike_mid = get_mid_fuzzy("hike")
+            hold_mid = get_mid_fuzzy("hold")
+            cut_mid = get_mid_fuzzy("cut")
+            
+            if hike_mid and hold_mid and cut_mid:
+                self.fair_value.fed.update_from_book_mids(hike_mid, hold_mid, cut_mid)
+                self.fair_value.recompute_c()
+            print(f"[DEBUG] Available symbols: {list(self.order_books.keys())}")  # Debug just in case
 
             for symbol in ["A"]:
                 fair = self.fair_value.get(symbol)
@@ -211,12 +278,52 @@ class MyXchangeClient(XChangeClient):
                 if using_market_mid:
                     # Pre-calibration: quote wider, smaller size
                     pos = self.positions.get(symbol, 0)
-                    skew = -pos * 0.15
-                    bid_price = int(fair + skew - 10)
-                    ask_price = int(fair + skew + 10)
+                    skew_mult = config.PARAMS[symbol].get("skew_mult", 0.15)
+                    skew = -pos * skew_mult
+                    spread = config.PARAMS[symbol].get("spread", 6) + 4
+                    bid_price = int(fair + skew - spread)
+                    ask_price = int(fair + skew + spread)
                     if pos < 20:
                         await self.place_order(symbol, 5, Side.BUY, bid_price)
                     if pos > -20:
+                        await self.place_order(symbol, 5, Side.SELL, ask_price)
+                else:
+                    await self.quote_around(symbol, fair)
+                
+
+                    # ---- C: same structure as A ----
+            for symbol in ["C"]:
+                fair = self.fair_value.get(symbol)
+                using_market_mid = False
+
+                if fair is None:
+                    book = self.order_books.get(symbol)
+                    if book and book.bids and book.asks:
+                        bids = [k for k, v in book.bids.items() if v > 0]
+                        asks = [k for k, v in book.asks.items() if v > 0]
+                        if bids and asks:
+                            fair_mid = (max(bids) + min(asks)) / 2
+                            # Instead of just using market mid indefinitely, we can infer C's initial EPS
+                            self.fair_value.infer_eps_c(fair_mid)
+                            fair = self.fair_value.get(symbol)
+
+                if fair is None:
+                    continue
+
+                print(f"[QUOTE] {symbol}: fair={fair:.0f}")
+                await self.cancel_all_orders(symbol)
+
+                if using_market_mid:
+                    # Pre-earnings: quote wider, smaller size, tighter position limit
+                    pos = self.positions.get(symbol, 0)
+                    skew_mult = config.PARAMS[symbol].get("skew_mult", 0.15)
+                    skew = -pos * skew_mult
+                    spread = config.PARAMS[symbol].get("spread", 2) + 2
+                    bid_price = int(fair + skew - spread)
+                    ask_price = int(fair + skew + spread)
+                    if pos < 10:
+                        await self.place_order(symbol, 5, Side.BUY, bid_price)
+                    if pos > -10:
                         await self.place_order(symbol, 5, Side.SELL, ask_price)
                 else:
                     await self.quote_around(symbol, fair)
@@ -227,6 +334,10 @@ class MyXchangeClient(XChangeClient):
             fair_a = self.fair_value.get("A") or 0
             mark_to_market = cash + (pos_a * fair_a)
             print(f"[PNL] cash={cash} | pos_A={pos_a} | mtm={mark_to_market:.0f}")
+            pos_c  = self.positions.get("C", 0)
+            fair_c = self.fair_value.get("C") or 0
+            # update the existing print to include C:
+            print(f"[PNL] cash={cash} | pos_A={pos_a} | pos_C={pos_c} | mtm={cash + pos_a*fair_a + pos_c*fair_c:.0f}")
 
     async def start(self):
         asyncio.create_task(self.trade_loop())
@@ -240,4 +351,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())# Debug
