@@ -9,10 +9,13 @@ from risk import RiskManager
 from options import (
     midpoint,
     best_bid_ask,
-    detect_parity_signal,
     detect_box_signal,
     call_symbol,
     put_symbol,
+    compute_fair_b,
+    find_stale_orders,
+    detect_butterfly_orders,
+    detect_vertical_orders,
 )
 
 class MyXchangeClient(XChangeClient):
@@ -104,235 +107,103 @@ class MyXchangeClient(XChangeClient):
             await self.place_order(symbol, size, Side.SELL, ask_price)
 
     
-    async def execute_b_parity_trade(self, signal):
-        strike = signal.strike
-        qty = signal.qty
-
-        c_sym = call_symbol(strike)
-        p_sym = put_symbol(strike)
-        b_sym = "B"
-
-        await self.cancel_all_orders(c_sym)
-        await self.cancel_all_orders(p_sym)
-        await self.cancel_all_orders(b_sym)
-
-        call_book = self.order_books.get(c_sym)
-        put_book = self.order_books.get(p_sym)
-        stock_book = self.order_books.get(b_sym)
-
-        if not call_book or not put_book or not stock_book:
-            return
-
-        c_bid, c_ask = best_bid_ask(call_book)
-        p_bid, p_ask = best_bid_ask(put_book)
-        b_bid, b_ask = best_bid_ask(stock_book)
-
-        if signal.action == "SELL_CALL_BUY_PUT_BUY_STOCK":
-            if None in (c_bid, p_ask, b_ask):
-                return
-            if not all(self._valid_price(p) for p in [c_bid, p_ask, b_ask]):
-                return
-            
-            changes = {
-                c_sym: -qty,
-                p_sym: qty,
-                b_sym: qty,
-            }
-
-            if not self.risk.can_trade_b_package(
-                changes,
-                config.B_MAX_POSITION,
-                config.B_MAX_GROSS_FAMILY,
-            ):
-                print(f"[B PARITY BLOCKED] strike={strike} risk")
-                return
-
-            print(f"[B PARITY] {signal.action} strike={strike} gap={signal.gap:.2f}")
-            await self.place_order(c_sym, qty, Side.SELL, c_bid)
-            await self.place_order(p_sym, qty, Side.BUY, p_ask)
-            await self.place_order(b_sym, qty, Side.BUY, b_ask)
-
-
-        elif signal.action == "BUY_CALL_SELL_PUT_SELL_STOCK":
-            if None in (c_ask, p_bid, b_bid):
-                return
-            
-            if not all(self._valid_price(p) for p in [c_ask, p_bid, b_bid]):
-                return
-            
-            changes = {
-                c_sym: qty,
-                p_sym: -qty,
-                b_sym: -qty,
-            }
-
-            if not self.risk.can_trade_b_package(
-                changes,
-                config.B_MAX_POSITION,
-                config.B_MAX_GROSS_FAMILY,
-            ):
-                # print(f"[B PARITY BLOCKED] strike={strike} risk")
-                return
-
-            print(f"[B PARITY] {signal.action} strike={strike} gap={signal.gap:.2f}")
-            await self.place_order(c_sym, qty, Side.BUY, c_ask)
-            await self.place_order(p_sym, qty, Side.SELL, p_bid)
-            await self.place_order(b_sym, qty, Side.SELL, b_bid)
-
     
-    async def execute_b_box_trade(self, signal):
-        k1, k2, qty = signal.k1, signal.k2, signal.qty
-
-        c1 = call_symbol(k1)
-        c2 = call_symbol(k2)
-        p1 = put_symbol(k1)
-        p2 = put_symbol(k2)
-
-        for sym in [c1, c2, p1, p2]:
-            await self.cancel_all_orders(sym)
-
-        books = [self.order_books.get(sym) for sym in [c1, c2, p1, p2]]
-        if any(book is None for book in books):
-            return
-
-        c1_bid, c1_ask = best_bid_ask(self.order_books[c1])
-        c2_bid, c2_ask = best_bid_ask(self.order_books[c2])
-        p1_bid, p1_ask = best_bid_ask(self.order_books[p1])
-        p2_bid, p2_ask = best_bid_ask(self.order_books[p2])
-
-        if signal.action == "BUY_BOX":
-            if None in (c1_ask, c2_bid, p2_ask, p1_bid):
-                return
-
-            if not all(self._valid_price(p) for p in [c1_ask, c2_bid, p2_ask, p1_bid]):
-                return
-
-            changes = {
-                c1: qty,
-                c2: -qty,
-                p2: qty,
-                p1: -qty,
-            }
-
-            if not self.risk.can_trade_b_package(
-                changes,
-                config.B_MAX_POSITION,
-                config.B_MAX_GROSS_FAMILY,
-            ):
-                print(f"[B BOX BLOCKED] {k1}-{k2} risk")
-                return
-
-            print(f"[B BOX] BUY_BOX {k1}-{k2} price={signal.price:.2f} fair={signal.fair:.2f}")
-            await self.place_order(c1, qty, Side.BUY, c1_ask)
-            await self.place_order(c2, qty, Side.SELL, c2_bid)
-            await self.place_order(p2, qty, Side.BUY, p2_ask)
-            await self.place_order(p1, qty, Side.SELL, p1_bid)
-
-            
-
-        elif signal.action == "SELL_BOX":
-            if None in (c1_bid, c2_ask, p2_bid, p1_ask):
-                return
-            if not all(self._valid_price(p) for p in [c1_bid, c2_ask, p2_bid, p1_ask]):
-                return
-            changes = {
-                c1: -qty,
-                c2: qty,
-                p2: -qty,
-                p1: qty,
-            }
-
-            if not self.risk.can_trade_b_package(
-                changes,
-                config.B_MAX_POSITION,
-                config.B_MAX_GROSS_FAMILY,
-            ):
-                print(f"[B BOX BLOCKED] {k1}-{k2} risk")
-                return
-
-            print(f"[B BOX] SELL_BOX {k1}-{k2} price={signal.price:.2f} fair={signal.fair:.2f}")
-            await self.place_order(c1, qty, Side.SELL, c1_bid)
-            await self.place_order(c2, qty, Side.BUY, c2_ask)
-            await self.place_order(p2, qty, Side.SELL, p2_bid)
-            await self.place_order(p1, qty, Side.BUY, p1_ask)
+    
+    
 
         
     async def bot_handle_book_update(self, symbol:str) -> None:
-        b_relevant = {"B"} | {f"B_C_{k}" for k in config.B_STRIKES} | {f"B_P_{k}" for k in config.B_STRIKES}
+        b_relevant = {f"B_C_{k}" for k in config.B_STRIKES} | {f"B_P_{k}" for k in config.B_STRIKES}
         if symbol not in b_relevant:
             return
 
-        # Need underlying B midpoint first
-        b_book = self.order_books.get("B")
-        if not b_book:
-            return
+        orders_to_fire = []
 
-        b_mid = midpoint(b_book)
-        if b_mid is None:
-            return
-
-        # ----- Parity checks -----
-        for strike in config.B_STRIKES:
-            c_sym = call_symbol(strike)
-            p_sym = put_symbol(strike)
-
-            c_book = self.order_books.get(c_sym)
-            p_book = self.order_books.get(p_sym)
-            if not c_book or not p_book:
-                continue
-
-            c_mid = midpoint(c_book)
-            p_mid = midpoint(p_book)
-
-            c_bid, c_ask = best_bid_ask(c_book)
-            p_bid, p_ask = best_bid_ask(p_book)
-            b_bid, b_ask = best_bid_ask(b_book)
-            c_spread = (c_ask - c_bid) if (c_bid and c_ask) else None
-            p_spread = (p_ask - p_bid) if (p_bid and p_ask) else None
-            b_spread = (b_ask - b_bid) if (b_bid and b_ask) else None
-
-            signal = detect_parity_signal(
-                call_mid=c_mid,
-                put_mid=p_mid,
-                stock_mid=b_mid,
-                strike=strike,
-                threshold=config.B_PARITY_THRESHOLD,
-                qty=config.B_PARITY_ORDER_SIZE,
-                call_spread=c_spread,   
-                put_spread=p_spread,    
-                stock_spread=b_spread, 
+        # Strategy 3: Vertical bounds — fastest, model-free, run first
+        if not self.risk.on_cooldown("vertical", 0.2):
+            orders_to_fire.extend(
+                detect_vertical_orders(self.order_books, config.B_STRIKES, config.B_VERTICAL_SIZE)
             )
 
-            if signal is not None:
-                signal_key = f"parity_{strike}"
-                if not self.risk.on_cooldown(signal_key, config.B_SIGNAL_COOLDOWN):
-                    await self.execute_b_parity_trade(signal)
+        # Strategy 2: Butterfly arb — model-free
+        if not self.risk.on_cooldown("butterfly", 0.2):
+            orders_to_fire.extend(
+                detect_butterfly_orders(self.order_books, config.B_BUTTERFLY_SIZE)
+            )
 
-        # ----- Box checks -----
+        # Strategy 1: Stale quote sniping — main edge
+        fair_b = compute_fair_b(self.order_books, config.B_STRIKES)
+        if fair_b is not None and not self.risk.on_cooldown("snipe", 0.2):
+            print(f"[FAIR_B] {fair_b:.1f}") # The [FAIR_B] print tells you on competition day exactly when Strategy 1 is activating and by how much fair_b moved. 
+            orders_to_fire.extend(
+                find_stale_orders(self.order_books, fair_b, config.B_STRIKES, config.B_SWEEP_EDGE, config.B_SNIPE_ORDER_SIZE)
+            )
+        # Moved check: not sure if we need - Strategy 1 only activates when fair_b shifts by more than 3 points since last time, basically ignores noise 
+        # and only fires when required saving computaion but lwk its fast enough that we are not wasting time - TBD
+
+        # if fair_b is not None:
+        #     moved = self.last_fair_b is None or abs(fair_b - self.last_fair_b) > 3.0
+        #     self.last_fair_b = fair_b
+        #     if moved and not self.risk.on_cooldown("snipe", 0.2):
+        #         print(f"[FAIR_B] {fair_b:.1f} moved from {self.last_fair_b:.1f}")
+        #         orders_to_fire.extend(
+        #             find_stale_orders(self.order_books, fair_b, config.B_STRIKES, config.B_SWEEP_EDGE, config.B_SNIPE_ORDER_SIZE)
+        #         )
+
+        # Box spreads — existing logic, now inline
         for k1, k2 in config.B_BOX_PAIRS:
+            if self.risk.on_cooldown(f"box_{k1}_{k2}", config.B_SIGNAL_COOLDOWN):
+                continue
             c1_book = self.order_books.get(call_symbol(k1))
             c2_book = self.order_books.get(call_symbol(k2))
             p1_book = self.order_books.get(put_symbol(k1))
             p2_book = self.order_books.get(put_symbol(k2))
-
             if not all([c1_book, c2_book, p1_book, p2_book]):
                 continue
-
             signal = detect_box_signal(
-                call_k1=midpoint(c1_book),
-                call_k2=midpoint(c2_book),
-                put_k1=midpoint(p1_book),
-                put_k2=midpoint(p2_book),
-                k1=k1,
-                k2=k2,
-                threshold=config.B_BOX_THRESHOLD,
-                qty=config.B_BOX_ORDER_SIZE,
+                call_k1=midpoint(c1_book), call_k2=midpoint(c2_book),
+                put_k1=midpoint(p1_book),  put_k2=midpoint(p2_book),
+                k1=k1, k2=k2,
+                threshold=config.B_BOX_THRESHOLD, qty=config.B_BOX_ORDER_SIZE,
             )
+            if signal is None:
+                continue
+            c1_bid, c1_ask = best_bid_ask(c1_book)
+            c2_bid, c2_ask = best_bid_ask(c2_book)
+            p1_bid, p1_ask = best_bid_ask(p1_book)
+            p2_bid, p2_ask = best_bid_ask(p2_book)
+            if signal.action == "BUY_BOX" and all(p is not None for p in [c1_ask, c2_bid, p2_ask, p1_bid]):
+                orders_to_fire += [
+                    (call_symbol(k1), signal.qty, Side.BUY,  c1_ask),
+                    (call_symbol(k2), signal.qty, Side.SELL, c2_bid),
+                    (put_symbol(k2),  signal.qty, Side.BUY,  p2_ask),
+                    (put_symbol(k1),  signal.qty, Side.SELL, p1_bid),
+                ]
+            elif signal.action == "SELL_BOX" and all(p is not None for p in [c1_bid, c2_ask, p2_bid, p1_ask]):
+                orders_to_fire += [
+                    (call_symbol(k1), signal.qty, Side.SELL, c1_bid),
+                    (call_symbol(k2), signal.qty, Side.BUY,  c2_ask),
+                    (put_symbol(k2),  signal.qty, Side.SELL, p2_bid),
+                    (put_symbol(k1),  signal.qty, Side.BUY,  p1_ask),
+                ]
 
-            if signal is not None:
-                signal_key = f"box_{k1}_{k2}"
-                if not self.risk.on_cooldown(signal_key, config.B_SIGNAL_COOLDOWN):
-                    await self.execute_b_box_trade(signal)
+        # Deduplicate by symbol — first order for each symbol wins
+        valid_orders = []
+        for sym, qty, side, price in orders_to_fire:
+            delta = qty if side == Side.BUY else -qty
+            if self.risk.can_trade_b_package(
+                {sym: delta}, config.B_MAX_POSITION, config.B_MAX_GROSS_FAMILY
+            ):
+                valid_orders.append((sym, qty, side, price))
+
+        # Fire everything concurrently — single tick
+        if valid_orders:
+            for sym, qty, side, price in valid_orders:
+                print(f"[FIRE] {sym} {side} {qty}@{price}")
+            await asyncio.gather(*[
+                self.place_order(sym, qty, side, price)
+                for sym, qty, side, price in valid_orders
+            ])
 
 
     async def calibrate_after_delay(self, symbol, eps):

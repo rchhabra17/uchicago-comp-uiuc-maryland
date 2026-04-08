@@ -35,3 +35,8 @@ B_MAX_POSITION = {
     "B_P_1000": 20,
     "B_P_1050": 20,
 }
+
+B_SWEEP_EDGE = 2.0          # min edge to snipe a stale quote
+B_SNIPE_ORDER_SIZE = 3      # qty per stale snipe hit
+B_BUTTERFLY_SIZE = 3        # qty per butterfly leg
+B_VERTICAL_SIZE = 3         # qty per vertical arb leg
