@@ -10,6 +10,7 @@ from options import (
     midpoint,
     best_bid_ask,
     detect_box_signal,
+    detect_parity_signal_tradeable,
     call_symbol,
     put_symbol,
     compute_fair_b,
@@ -26,6 +27,8 @@ class MyXchangeClient(XChangeClient):
         self.risk = RiskManager()
         self.pnl = 0
         self.b_cash = 0.0
+
+        self.b_relevant = {f"B_C_{k}" for k in config.B_STRIKES} | {f"B_P_{k}" for k in config.B_STRIKES} | {"B"}
 
 
     # DUMMY BOILERPLATE CODE
@@ -113,96 +116,149 @@ class MyXchangeClient(XChangeClient):
 
         
     async def bot_handle_book_update(self, symbol:str) -> None:
-        b_relevant = {f"B_C_{k}" for k in config.B_STRIKES} | {f"B_P_{k}" for k in config.B_STRIKES}
-        if symbol not in b_relevant:
+        if symbol not in self.b_relevant:
             return
 
         orders_to_fire = []
+        total_changes = {}
 
-        # Strategy 3: Vertical bounds — fastest, model-free, run first
-        if not self.risk.on_cooldown("vertical", 0.2):
-            orders_to_fire.extend(
-                detect_vertical_orders(self.order_books, config.B_STRIKES, config.B_VERTICAL_SIZE)
-            )
+        # Pre-compute current market state for O(1) instantaneous lookups
+        quotes = {}
+        for sym in self.b_relevant:
+            book = self.order_books.get(sym)
+            quotes[sym] = best_bid_ask(book) if book else (None, None)
 
-        # Strategy 2: Butterfly arb — model-free
-        if not self.risk.on_cooldown("butterfly", 0.2):
-            orders_to_fire.extend(
-                detect_butterfly_orders(self.order_books, config.B_BUTTERFLY_SIZE)
-            )
+        # [TOGGLE START] Standard Arbitrage (Box & Parity) Disabled
+        """
+        # Tradeable Put-Call Parity
+        s_bid, s_ask = quotes["B"]
+        if s_bid is not None or s_ask is not None:
+            for k in config.B_STRIKES:
+                if self.risk.on_cooldown(f"parity_{k}", config.B_SIGNAL_COOLDOWN):
+                    continue
+                c_bid, c_ask = quotes[call_symbol(k)]
+                p_bid, p_ask = quotes[put_symbol(k)]
 
-        # Strategy 1: Stale quote sniping — main edge
-        fair_b = compute_fair_b(self.order_books, config.B_STRIKES)
-        if fair_b is not None and not self.risk.on_cooldown("snipe", 0.2):
-            print(f"[FAIR_B] {fair_b:.1f}") # The [FAIR_B] print tells you on competition day exactly when Strategy 1 is activating and by how much fair_b moved. 
-            orders_to_fire.extend(
-                find_stale_orders(self.order_books, fair_b, config.B_STRIKES, config.B_SWEEP_EDGE, config.B_SNIPE_ORDER_SIZE)
-            )
-        # Moved check: not sure if we need - Strategy 1 only activates when fair_b shifts by more than 3 points since last time, basically ignores noise 
-        # and only fires when required saving computaion but lwk its fast enough that we are not wasting time - TBD
+                signal = detect_parity_signal_tradeable(
+                    stock_bid=s_bid, stock_ask=s_ask,
+                    call_bid=c_bid, call_ask=c_ask,
+                    put_bid=p_bid, put_ask=p_ask,
+                    strike=k, threshold=config.B_PARITY_THRESHOLD, qty=config.B_PARITY_ORDER_SIZE
+                )
+                
+                if signal:
+                    parity_legs = []
+                    if signal.action == "SELL_CALL_BUY_PUT_BUY_STOCK":
+                        parity_legs = [
+                            (call_symbol(k), signal.qty, Side.SELL, c_bid),
+                            (put_symbol(k), signal.qty, Side.BUY, p_ask),
+                            ("B", signal.qty, Side.BUY, s_ask)
+                        ]
+                    elif signal.action == "BUY_CALL_SELL_PUT_SELL_STOCK":
+                        parity_legs = [
+                            (call_symbol(k), signal.qty, Side.BUY, c_ask),
+                            (put_symbol(k), signal.qty, Side.SELL, p_bid),
+                            ("B", signal.qty, Side.SELL, s_bid)
+                        ]
+                    
+                    if parity_legs:
+                        changes = {}
+                        for sym, q, s, _ in parity_legs:
+                            delta = q if s == Side.BUY else -q
+                            changes[sym] = changes.get(sym, 0) + delta
+                        
+                        combined = total_changes.copy()
+                        for sym, delta in changes.items():
+                            combined[sym] = combined.get(sym, 0) + delta
+                            
+                        if self.risk.can_trade_b_package(combined, config.B_MAX_POSITION, config.B_MAX_GROSS_FAMILY):
+                            orders_to_fire.extend(parity_legs)
+                            total_changes = combined
 
-        # if fair_b is not None:
-        #     moved = self.last_fair_b is None or abs(fair_b - self.last_fair_b) > 3.0
-        #     self.last_fair_b = fair_b
-        #     if moved and not self.risk.on_cooldown("snipe", 0.2):
-        #         print(f"[FAIR_B] {fair_b:.1f} moved from {self.last_fair_b:.1f}")
-        #         orders_to_fire.extend(
-        #             find_stale_orders(self.order_books, fair_b, config.B_STRIKES, config.B_SWEEP_EDGE, config.B_SNIPE_ORDER_SIZE)
-        #         )
-
-        # Box spreads — existing logic, now inline
         for k1, k2 in config.B_BOX_PAIRS:
             if self.risk.on_cooldown(f"box_{k1}_{k2}", config.B_SIGNAL_COOLDOWN):
                 continue
-            c1_book = self.order_books.get(call_symbol(k1))
-            c2_book = self.order_books.get(call_symbol(k2))
-            p1_book = self.order_books.get(put_symbol(k1))
-            p2_book = self.order_books.get(put_symbol(k2))
-            if not all([c1_book, c2_book, p1_book, p2_book]):
-                continue
+            c1_bid, c1_ask = quotes[call_symbol(k1)]
+            c2_bid, c2_ask = quotes[call_symbol(k2)]
+            p1_bid, p1_ask = quotes[put_symbol(k1)]
+            p2_bid, p2_ask = quotes[put_symbol(k2)]
+
             signal = detect_box_signal(
-                call_k1=midpoint(c1_book), call_k2=midpoint(c2_book),
-                put_k1=midpoint(p1_book),  put_k2=midpoint(p2_book),
                 k1=k1, k2=k2,
                 threshold=config.B_BOX_THRESHOLD, qty=config.B_BOX_ORDER_SIZE,
+                call_k1_bid=c1_bid, call_k1_ask=c1_ask,
+                call_k2_bid=c2_bid, call_k2_ask=c2_ask,
+                put_k1_bid=p1_bid, put_k1_ask=p1_ask,
+                put_k2_bid=p2_bid, put_k2_ask=p2_ask,
             )
             if signal is None:
                 continue
-            c1_bid, c1_ask = best_bid_ask(c1_book)
-            c2_bid, c2_ask = best_bid_ask(c2_book)
-            p1_bid, p1_ask = best_bid_ask(p1_book)
-            p2_bid, p2_ask = best_bid_ask(p2_book)
+
+            box_legs = []
             if signal.action == "BUY_BOX" and all(p is not None for p in [c1_ask, c2_bid, p2_ask, p1_bid]):
-                orders_to_fire += [
+                box_legs = [
                     (call_symbol(k1), signal.qty, Side.BUY,  c1_ask),
                     (call_symbol(k2), signal.qty, Side.SELL, c2_bid),
                     (put_symbol(k2),  signal.qty, Side.BUY,  p2_ask),
                     (put_symbol(k1),  signal.qty, Side.SELL, p1_bid),
                 ]
             elif signal.action == "SELL_BOX" and all(p is not None for p in [c1_bid, c2_ask, p2_bid, p1_ask]):
-                orders_to_fire += [
+                box_legs = [
                     (call_symbol(k1), signal.qty, Side.SELL, c1_bid),
                     (call_symbol(k2), signal.qty, Side.BUY,  c2_ask),
                     (put_symbol(k2),  signal.qty, Side.SELL, p2_bid),
                     (put_symbol(k1),  signal.qty, Side.BUY,  p1_ask),
                 ]
 
-        # Deduplicate by symbol — first order for each symbol wins
-        valid_orders = []
-        for sym, qty, side, price in orders_to_fire:
-            delta = qty if side == Side.BUY else -qty
-            if self.risk.can_trade_b_package(
-                {sym: delta}, config.B_MAX_POSITION, config.B_MAX_GROSS_FAMILY
-            ):
-                valid_orders.append((sym, qty, side, price))
+            if box_legs:
+                changes = {}
+                for sym, q, s, _ in box_legs:
+                    delta = q if s == Side.BUY else -q
+                    changes[sym] = changes.get(sym, 0) + delta
+                
+                combined = total_changes.copy()
+                for sym, delta in changes.items():
+                    combined[sym] = combined.get(sym, 0) + delta
+                    
+                if self.risk.can_trade_b_package(combined, config.B_MAX_POSITION, config.B_MAX_GROSS_FAMILY):
+                    orders_to_fire.extend(box_legs)
+                    total_changes = combined
+        """
+        # [TOGGLE END]
 
-        # Fire everything concurrently — single tick
-        if valid_orders:
-            for sym, qty, side, price in valid_orders:
-                print(f"[FIRE] {sym} {side} {qty}@{price}")
+        # 1. Dead-Leg Trap Strategy
+        for sym in self.b_relevant:
+            # Look for missing bids to trap
+            b_bid, b_ask = quotes[sym]
+            if b_bid is None and b_ask is not None:
+                if self.risk.get_position(sym) < 20: 
+                    # Only place one active trap order at a time per dead leg
+                    open_bids = sum(1 for oid, info in self.open_orders.items() if info[0].symbol == sym and info[0].side == 1)
+                    if open_bids == 0:
+                        orders_to_fire.append((sym, 5, Side.BUY, 1))
+
+        # 2. Strategy 1: Stale Sniping
+        fair_b = compute_fair_b(quotes, config.B_STRIKES)
+        if fair_b is not None:
+            if not self.risk.on_cooldown("snipe", 0.2):
+                stale_orders = find_stale_orders(quotes, fair_b, config.B_STRIKES, config.B_SWEEP_EDGE, config.B_SNIPE_ORDER_SIZE)
+                if stale_orders:
+                    # Filter snipes through risk checks
+                    for sym, qty, side, price in stale_orders:
+                        delta = qty if side == Side.BUY else -qty
+                        combined = total_changes.copy()
+                        combined[sym] = combined.get(sym, 0) + delta
+                        if self.risk.can_trade_b_package(combined, config.B_MAX_POSITION, config.B_MAX_GROSS_FAMILY):
+                            orders_to_fire.append((sym, qty, side, price))
+                            total_changes = combined
+
+        if orders_to_fire:
+            for sym, qty, side, price in orders_to_fire:
+                tag = "TRAP" if price == 1 else "SNIPE"
+                print(f"[{tag}] {sym} {side} {qty}@{price}")
             await asyncio.gather(*[
                 self.place_order(sym, qty, side, price)
-                for sym, qty, side, price in valid_orders
+                for sym, qty, side, price in orders_to_fire
             ])
 
 
@@ -398,8 +454,23 @@ class MyXchangeClient(XChangeClient):
             # print(f"[B MTM] {self.compute_b_mtm():.2f}")
             self.print_b_pnl()
 
+    async def arb_cleanup_loop(self):
+        """Scrub lingering unfilled leg fragments to prevent Outstanding Volume breaches and stale directional fills."""
+        while True:
+            await asyncio.sleep(0.5)  # Sweep every 500ms
+            to_cancel = []
+            for oid, info in list(self.open_orders.items()):
+                if info[0].symbol in self.b_relevant:
+                    is_market = info[2]
+                    price = info[0].limit.px if not is_market else -1
+                    if price != 1:
+                        to_cancel.append(oid)
+            if to_cancel:
+                await asyncio.gather(*[self.cancel_order(oid) for oid in to_cancel])
+
     async def start(self):
         asyncio.create_task(self.trade_loop())
+        asyncio.create_task(self.arb_cleanup_loop())
         await self.connect()
 
 
