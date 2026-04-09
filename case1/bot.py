@@ -345,8 +345,8 @@ class MyXchangeClient(XChangeClient):
 
 
 async def main():
-    SERVER = '34.197.188.76'
-    my_client = MyXchangeClient(f"{SERVER}:3333", "maryland_uiuc", "torch-karma-beacon")
+    SERVER = 'https://practice.uchicago.exchange'
+    my_client = MyXchangeClient("practice.uchicago.exchange:3333", "maryland_uiuc", "torch-karma-beacon")
     await my_client.start()
 
 

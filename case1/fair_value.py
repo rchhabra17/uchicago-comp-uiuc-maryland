@@ -1,17 +1,20 @@
-# In fair_value.py
+# fair_value.py
 
 import math
 
-# Add these constants at the top — update when released on Ed
-C_GAMMA  = 0.5
-C_BETA_Y = 0.0001
-C_Y0     = 0.04
-C_PE0    = 20.0
-C_B0     = 1000.0
-C_D      = 7.0
-C_CCONV  = 50.0
-C_LAMBDA = 0.5
-C_N      = 100.0
+# C parameters — revealed by organizers
+C_Y0        = 0.045   # baseline yield
+C_PE0       = 14.0    # baseline P/E
+C_EPS0      = 2.00    # baseline EPS (for sanity checks / fallback)
+C_D         = 7.5     # duration
+C_CCONV     = 55.0    # convexity
+C_B0_OVER_N = 40.0    # bond portfolio value per share (B0 / N)
+C_LAMBDA    = 0.65    # bond component weighting
+
+# C parameters — NOT revealed, must assume & tune
+C_GAMMA     = 15.0    # PE sensitivity to yield changes (tune live; 0.5 was way too low)
+C_BETA_Y    = 0.0001  # yield sensitivity to E[Δr] in bps (25bp E[Δr] → 25bp yield move)
+
 
 class FedModel:
     def __init__(self):
@@ -52,45 +55,19 @@ class FedModel:
         return C_Y0 + C_BETA_Y * self.expected_delta_r
 
 
-# Then in FairValueEngine.__init__, add:
-#   self.fed   = FedModel()
-#   self.eps_c = None
-#   self.fair_c = None
-
-# Add these methods to FairValueEngine:
-def update_c(self, eps: float) -> float | None:
-    self.eps_c = eps
-    return self._compute_c()
-
-def recompute_c(self) -> float | None:
-    return self._compute_c()
-
-def _compute_c(self) -> float | None:
-    if self.eps_c is None:
-        return None
-    y_t     = self.fed.implied_yield
-    delta_y = y_t - C_Y0
-    pe_t    = C_PE0 * math.exp(-C_GAMMA * delta_y)
-    p_ops   = self.eps_c * pe_t
-    delta_b = C_B0 * (-C_D * delta_y + 0.5 * C_CCONV * delta_y ** 2)
-    self.fair_c = p_ops + C_LAMBDA * delta_b / C_N
-    print(f"[C FV] fair={self.fair_c:.2f}  eps={self.eps_c:.4f}  PE={pe_t:.2f}")
-    return self.fair_c
-
-# And in get(), add:
-#   if symbol == "C":
-#       return self.fair_c
-
 class FairValueEngine:
     def __init__(self):
+        # A
         self.eps_a = None
         self.fair_a = None
         self.pe_a = None
         self.calibrating = True
-        self.fed   = FedModel()
+        # C
+        self.fed = FedModel()
         self.eps_c = None
         self.fair_c = None
 
+    # ---------- A ----------
     def update_a(self, eps: float, market_mid: float = None) -> float | None:
         self.eps_a = eps
 
@@ -113,18 +90,13 @@ class FairValueEngine:
             self.fair_a = self.eps_a * self.pe_a
             print(f"[CALIBRATE] PE_A = {self.pe_a:.1f} (from mid={market_mid}, eps={self.eps_a})")
 
-    def get(self, symbol: str) -> float | None:
-        if symbol == "A":
-            return self.fair_a
-        if symbol == "C":
-            return self.fair_c
-        return None
-    
+    # ---------- C ----------
     def update_c(self, eps: float) -> float | None:
         self.eps_c = eps
         return self._compute_c()
 
     def recompute_c(self) -> float | None:
+        """Call when Fed probabilities change but EPS hasn't."""
         return self._compute_c()
 
     def _compute_c(self) -> float | None:
@@ -134,19 +106,29 @@ class FairValueEngine:
         delta_y = y_t - C_Y0
         pe_t    = C_PE0 * math.exp(-C_GAMMA * delta_y)
         p_ops   = self.eps_c * pe_t
-        delta_b = C_B0 * (-C_D * delta_y + 0.5 * C_CCONV * delta_y ** 2)
-        self.fair_c = p_ops + C_LAMBDA * delta_b / C_N
-        print(f"[C FV] fair={self.fair_c:.2f}  eps={self.eps_c:.4f}  PE={pe_t:.2f}")
+        # bond P&L per share (B0_OVER_N already folds in the 1/N)
+        delta_b_per_share = C_B0_OVER_N * (-C_D * delta_y + 0.5 * C_CCONV * delta_y ** 2)
+        self.fair_c = p_ops + C_LAMBDA * delta_b_per_share
+        print(f"[C FV] fair={self.fair_c:.2f}  eps={self.eps_c:.4f}  PE={pe_t:.2f}  Δy={delta_y:+.5f}")
         return self.fair_c
 
     def infer_eps_c(self, market_mid: float):
+        """Back out implied EPS from market mid before the first C earnings release."""
         if self.eps_c is None:
             y_t     = self.fed.implied_yield
             delta_y = y_t - C_Y0
             pe_t    = C_PE0 * math.exp(-C_GAMMA * delta_y)
-            delta_b = C_B0 * (-C_D * delta_y + 0.5 * C_CCONV * delta_y ** 2)
-            
-            p_ops = market_mid - (C_LAMBDA * delta_b / C_N)
+            delta_b_per_share = C_B0_OVER_N * (-C_D * delta_y + 0.5 * C_CCONV * delta_y ** 2)
+
+            p_ops = market_mid - (C_LAMBDA * delta_b_per_share)
             self.eps_c = p_ops / pe_t
             print(f"[CALIBRATE] Implied EPS_C = {self.eps_c:.4f} from mid={market_mid}")
             self._compute_c()
+
+    # ---------- accessor ----------
+    def get(self, symbol: str) -> float | None:
+        if symbol == "A":
+            return self.fair_a
+        if symbol == "C":
+            return self.fair_c
+        return None

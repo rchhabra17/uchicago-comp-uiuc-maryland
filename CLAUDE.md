@@ -1,176 +1,454 @@
-# CLAUDE.md — UChicago Trading Competition 2026, Case 2
+# CLAUDE.md — UTC 2026 (UChicago Trading Competition)
 
-## Mission
-Maximize the **annualized Sharpe ratio** of a long/short portfolio over 25 assets across 5 sectors,
-evaluated on the 12 months immediately following the provided training CSV. Final code is due
-**11:59 PM CST, Thursday, April 9, 2026**. Code that fails to run on any tick = 0 points.
+This file provides guidance to Claude Code when working on code in this repository.
+Read this before touching anything.
 
-Sharpe is computed as `sqrt(252) * mean(r_t) / std(r_t)` on **net** returns (after costs/borrow).
-Variance reduction is as valuable as return generation. A consistent 1.5 Sharpe beats a lumpy 2.5.
+---
 
-## Hard Constraints (read every time before editing code)
-- **Universe:** 25 assets, 5 sectors (5 each). Intraday data: **30 ticks/day**.
-- **Weights:** can be +, −, or 0. **Sum of |w_i| ≤ 1.** Violations are rescaled proportionally by the
-  evaluator — but rescaling distorts intent, so enforce the constraint ourselves.
-- **Rebalance cadence:** algorithm receives price history each day and returns new weights. Costs are
-  charged on weight *changes* at end-of-day rebalance.
-- **Costs (must model exactly — they appear in scoring):**
-  - Linear: `0.5 * spread_bps * |Δw_i|`
-  - Quadratic: `2.5 * spread_bps * (Δw_i)^2`
-  - Borrow (per tick, shorts only): `short_exposure_i * borrow_bps_i * (1/252/30)`
-  - Total cost per rebalance = sum of linear + quadratic across assets.
-- **Returns within a day:** portfolio return per tick = Σ w_i * simple_return_i, where simple return
-  is derived from log return (`exp(log_ret) - 1`). Borrow charge applies every tick.
-- **Environment:** Python 3.12, only `numpy`, `pandas`, `scikit-learn`, `scipy`. No other deps unless
-  explicitly approved on Ed. Test in a clean venv that mirrors this before submitting.
-- **Failure mode:** any exception on any tick disqualifies us. **Wrap the strategy entry point in a
-  try/except that falls back to the last valid weights (or equal-weight) on error.**
+## Competition Overview
 
-## Inputs Provided
-- CSV of intraday tick prices for 25 assets (5 years × ~252 days × 30 ticks).
-- Per-asset metadata: sector label, bid-ask spread (bps), borrow cost (bps annualized).
-- Stub code with an example evaluator. **Treat the stub evaluator as a sanity check, not as ground
-  truth for final scoring** — packet explicitly warns against this.
+**UTC 2026 — 14th Annual UChicago Trading Competition**
 
-## Project Layout
-/data/            # raw CSV, never modified
-/src/
-strategy.py     # the submitted entry point (keep this minimal & robust)
-features.py     # signal construction (momentum, reversion, vol, sector)
-covariance.py   # covariance estimators (Ledoit-Wolf, OAS, shrinkage, factor)
-optimizer.py    # weight construction (RPA, mean-variance, robust)
-costs.py        # exact replica of evaluator cost model
-evaluator.py    # local backtester matching the spec
-/tests/
-test_constraints.py  # |w| sum, NaN, dim checks
-test_evaluator.py    # parity vs. stub on a known portfolio
-test_robustness.py   # missing data, flat asset, single-day input
-/notebooks/       # exploration only — never imported by strategy.py
+- **Location:** Convene Willis Tower, 233 S. Wacker Drive, Chicago
+- **Case 1 (Live Trading):** Saturday April 11, 2026 — algorithmic + click trading on a live exchange
+- **Case 2 (Portfolio Optimization):** Take-home, due **11:59 PM CST Thursday April 9, 2026**
+- **Scoring:** Rank-based across ALL teams globally (not just your room). Penalty = (rank − 1)². Lower is better.
+- **Language:** Python is the **only officially supported language**. No explicit support for other languages.
+- **Awards:** Cash prizes for winning team of each individual case + top 3 overall aggregate scores.
+- **Attendance:** All sessions Friday and Saturday are **mandatory** to be eligible for prizes.
 
-## How I Want You (Claude) to Work
+### Schedule (CDT)
 
-### Default behaviors
-1. **Read before writing.** Open `strategy.py`, `features.py`, and the stub evaluator before
-   proposing changes. Don't guess at interfaces.
-2. **Match the evaluator exactly.** Before any strategy work, verify our local `costs.py` and
-   `evaluator.py` reproduce the stub's output to numerical precision on a fixed test portfolio.
-   If they don't match, fix that first. Everything downstream depends on it.
-3. **Always run the local backtest after a change** and report: in-sample Sharpe, out-of-sample
-   Sharpe (held-out tail), turnover, average gross exposure, max drawdown, and cost drag (bps/yr).
-4. **Show me deltas.** When you change a strategy component, run an A/B against the prior version on
-   the same held-out window and report the Sharpe difference + a one-line attribution.
-5. **Don't overfit.** If you're tempted to tune a hyperparameter on the full series, stop and use a
-   walk-forward split instead. The packet specifically warns: *"Every year, people overfit. Don't
-   let that be you."*
-6. **Prefer simple + robust over clever + fragile.** A shrinkage-covariance risk-parity portfolio
-   that always runs beats a brilliant ML model that crashes on tick 4,732.
+**Friday April 10:**
+- 5:00–8:00 PM — Poker Tournament at Kimpton Gray Hotel (122 W. Monroe), sponsored by DRW
 
-### When proposing a new signal or estimator
-State up front:
-- What inefficiency it targets (momentum, reversion, sector dispersion, vol clustering, etc.)
-- Why it should generalize out-of-sample (economic rationale, not just backtest fit)
-- How it interacts with cost (does it require high turnover? if so, what's the breakeven edge?)
-- The single-line null hypothesis it would falsify if it failed
+**Saturday April 11:**
+- 8:00–8:45 AM — Breakfast & Arrival
+- 8:45–9:00 AM — Welcome & Agenda
+- 9:00–9:15 AM — Tech Case Prep
+- 9:15 AM–12:15 PM — **Case 1 Live Trading** (3 hours of rounds)
+- 12:15–2:00 PM — Lunch & Employer Career Fair
+- 2:00–2:45 PM — Overview of Cases 1 & 2 + Q&A
+- 2:45–4:15 PM — Networking Reception
+- 4:15–5:00 PM — Awards Presentation
 
-### When in doubt, ask
-If a design choice has real tradeoffs (e.g., "shrinkage intensity 0.3 vs adaptive", "rebalance daily
-vs every 3 days"), surface the tradeoff and ask me. Don't silently pick.
+---
 
-## Strategy Roadmap (build in this order — don't skip ahead)
+## Case 1: Live Trading (Market Making)
 
-### Phase 1 — Infrastructure (do this before any modeling)
-- [ ] Load CSV, validate shape (25 cols, ~37,800 rows), check for NaNs, gaps, zero/negative prices.
-- [ ] Compute log returns, simple returns, daily aggregated returns.
-- [ ] Implement `costs.py` — linear + quadratic transaction costs and per-tick borrow.
-- [ ] Implement `evaluator.py` — full path simulation: weights → tick returns → cost deduction →
-      Sharpe. Verify against stub evaluator on equal-weight, all-cash, and a random portfolio.
-- [ ] Walk-forward split utility: train on rolling window, evaluate on next month, never peek ahead.
-- [ ] Constraint enforcer: project any weight vector onto `{|w|_1 ≤ 1}` (use L1-ball projection).
+### Exchange Connectivity
 
-### Phase 2 — Baselines (every later strategy must beat these)
-- [ ] Equal-weight long-only (1/25). This is the floor.
-- [ ] Inverse-volatility weighting.
-- [ ] Risk-parity allocation (equal risk contribution) using sample covariance.
-- [ ] Risk parity using **Ledoit-Wolf shrunk covariance** — this is usually the strongest naive baseline.
+| Parameter                  | Value                                                |
+| -------------------------- | ---------------------------------------------------- |
+| Practice UI                | https://practice.uchicago.exchange/                  |
+| Practice bot endpoint      | `practice.uchicago.exchange:3333` (no HTTPS)         |
+| Competition day endpoint   | TBD (same AWS VPC as your EC2 instance)              |
+| Exchange tick rate         | every 200 ms                                         |
+| Round duration             | 15 minutes                                           |
 
-Record Sharpe + cost drag for each on the same held-out window. Put the table in `/notebooks/baselines.md`.
+- Bot connects via **gRPC** using `utcxchangelib` (Python 3.12)
+- Install: `pip install git+ssh://git@github.com/UChicagoFM/utcxchangelib.git`
+- **Always use the latest version** — reinstall before competition day
+- Example bot: `utcxchangelib/examples/example_bot.py`
+- On competition day you get a standard AWS EC2 instance to run your bot
+- One team member is responsible for **manually starting** the algo at the beginning of each round
+- Must know how to use **VSCode** and **SSH** into the provided box
 
-### Phase 3 — Covariance estimation (this is where most of the edge lives in 25-asset universes)
-- [ ] Ledoit-Wolf shrinkage (sklearn has it).
-- [ ] OAS shrinkage.
-- [ ] **Sector-block shrinkage**: shrink toward a structured target where intra-sector correlation
-      is the average intra-sector corr, inter-sector is the average inter-sector corr. This
-      exploits the 5-sector structure the packet *explicitly* tells us is meaningful.
-- [ ] Exponentially weighted covariance (favors recent regime).
-- [ ] Compare condition numbers and out-of-sample portfolio variance, not just Sharpe.
+### Round Structure & Scoring
 
-### Phase 4 — Return signals (only after covariance is solid)
-The packet hints at: momentum, mean reversion, cross-sector relationships, volatility clustering.
-Build these as orthogonal signals, then combine.
+- **3 hours** of successive rounds, each **15 minutes** long
+- Each round = **10 simulated days**, each day = **90 seconds** with **5 ticks** per day (tick every 200 ms within a second)
+- Positions **hold over** day-to-day within a round but **reset between rounds**
+- **Settlement price** for all assets at end of each round; P&L calculated from final prices
+- ETF settlement price = **NAV** (fair value)
+- Everything is **marked to fair value** at settlement
+- **Difficulty increases** over rounds: opposing market makers tighten spreads, volume decreases, volatility increases
+- **Later rounds weighted more heavily** in scoring
+- **Nonlinear grading:** converts P&L into points. Consistent profits >> high-variance strategies. Outlier results (positive or negative) have diminished marginal impact.
+- Practice round does **NOT** count toward final points
 
-- [ ] **Cross-sectional momentum** (rank assets by trailing return, long top / short bottom within sector).
-- [ ] **Short-term reversion** (1–3 day reversal — common intraday phenomenon).
-- [ ] **Sector-relative momentum** (asset return minus sector mean).
-- [ ] **Volatility-scaled signals** — never feed raw returns into a combiner without normalizing by vol.
-- [ ] **Signal combination**: simple average of z-scored signals first. Only move to regression /
-      Lasso / Ridge if the simple combination already beats baselines and you have a held-out set
-      to validate on.
+### Tradable Instruments
 
-For each signal: report IC (rank correlation of signal vs. next-period return), decay over horizons,
-and turnover it implies.
+| Symbol                            | Description                                                                 |
+| --------------------------------- | --------------------------------------------------------------------------- |
+| `A`                               | Small-cap equity. Priced via P/E × EPS. P/E **constant at 10**.             |
+| `B`                               | Large-cap equity (liquid semiconductor). No direct pricing info given.      |
+| `B_C_950`, `B_C_1000`, `B_C_1050` | **European** call options on B at strikes 950 / 1000 / 1050               |
+| `B_P_950`, `B_P_1000`, `B_P_1050` | **European** put options on B at strikes 950 / 1000 / 1050                |
+| `C`                               | Bond/rate-sensitive insurance company. Priced via business ops + bond portfolio. |
+| `ETF`                             | ETF = 1 share each of A, B, and C                                           |
+| `R_CUT`                           | Prediction market: probability of Fed rate **cut** (−25 bps)               |
+| `R_HOLD`                          | Prediction market: probability of Fed rate **hold** (0 bps)                |
+| `R_HIKE`                          | Prediction market: probability of Fed rate **hike** (+25 bps)              |
 
-### Phase 5 — Optimizer
-- [ ] Mean-variance with shrunk covariance and signal-based expected returns.
-- [ ] Add an L2 penalty on weights (tames the optimizer's appetite for extreme positions).
-- [ ] Add a turnover penalty: `λ * ||w_new - w_old||_1` — this is how you trade off cost vs. signal.
-- [ ] Solve via `scipy.optimize.minimize` with SLSQP, or closed-form if no inequality constraints
-      beyond the L1 ball (then project).
-- [ ] Sanity check: turn off signals → optimizer should converge to min-variance / risk-parity-like.
+### Risk Limits
 
-### Phase 6 — Robustness pass (do not skip)
-- [ ] What happens on day 1 when we have ~0 history? (Fall back to equal-weight or inverse-vol.)
-- [ ] What happens if a price series goes flat? (Vol = 0 → division by zero. Handle it.)
-- [ ] What happens if covariance is singular? (Always shrink, never invert raw sample cov.)
-- [ ] Time the strategy: must run comfortably within whatever per-tick budget the evaluator allows.
-- [ ] Re-run full backtest 5x with different random seeds wherever randomness exists. Sharpe should
-      be stable across seeds.
+**Will be announced via pinned Ed post in advance of competition. Subject to change on competition day.**
 
-### Phase 7 — Final hardening (day before submission)
-- [ ] Fresh venv, only the 4 allowed packages, run end-to-end.
-- [ ] Try-except wrapper around `get_weights()` returning last valid weights on any exception.
-- [ ] Log nothing to stdout in production code (may break the harness).
-- [ ] Re-read Case 2 spec one more time looking for any rule we missed.
+Risk limits apply **per instrument** across all tradable assets:
 
-## Things That Will Lose Points (avoid these)
-- **Lookahead bias.** Computing any statistic using data the algorithm wouldn't have at that tick.
-  When in doubt, lag by one tick.
-- **Overfitting to in-sample Sharpe.** If a strategy's IS Sharpe is 4 and OOS is 0.5, throw it away.
-- **Ignoring transaction costs while tuning.** A signal with IC=0.05 and 200% daily turnover loses
-  money after costs. Always optimize on net, not gross.
-- **Trusting the sample covariance matrix.** With 25 assets and short windows, it's nearly singular.
-  Always shrink.
-- **Crashing on edge cases.** A Sharpe-3 strategy that throws on day 47 scores zero.
-- **Submitting without testing in a clean Python 3.12 + 4-package environment.**
+| Limit                    | Description                                         | Current Value |
+| ------------------------ | --------------------------------------------------- | ------------- |
+| `max_order_size`         | Max lots per single order                           | 40            |
+| `max_open_orders`        | Max number of unfilled orders                       | 50            |
+| `max_outstanding_volume` | Total volume of unfilled orders                     | 120           |
+| `max_absolute_position`  | Sum of long and short positions                     | 200           |
 
-## Sanity Numbers (rough expectations — adjust as we learn the data)
-- Equal-weight long-only Sharpe: probably ~0.5–1.0 depending on market regime in the test window.
-- Risk parity with shrinkage: target 1.0–1.5.
-- Well-built signal + optimizer combo: 1.5–2.5 is ambitious but realistic.
-- Anything claiming >3 OOS on a 12-month window deserves extreme suspicion. Audit it for leakage.
+**Never hardcode these as literals.** Use named constants/variables so you can update instantly on the day. Exceeding any limit → entire order rejected. You are **not told which limit** you breached.
 
-## Communication Style I Want From You
-- Lead with the result, then the reasoning.
-- When you finish a task, give me a 3-line summary: what changed, OOS Sharpe before/after, what's next.
-- If something looks too good, *say so* and audit before celebrating.
-- Don't apologize. Don't pad. If there's a real tradeoff, surface it; if not, just ship.
-- Use plots sparingly — a number in a table beats a chart for tracking iteration.
+### Instrument Pricing Models
 
-## Final Pre-Submission Checklist
-- [ ] Runs end-to-end in clean venv (Python 3.12, numpy/pandas/sklearn/scipy only).
-- [ ] No print statements, no file writes outside allowed paths, no network calls.
-- [ ] Try/except fallback in place.
-- [ ] Constraint `sum(|w|) ≤ 1` enforced internally (don't rely on rescaling).
-- [ ] Local OOS Sharpe on held-out 12 months ≥ best baseline + meaningful margin.
-- [ ] Walk-forward Sharpe is stable (not driven by one lucky month).
-- [ ] Code is small, readable, commented at decision points.
-- [ ] Submitted before 11:59 PM CST Thursday, April 9 — **with margin, not at 11:58.**
+#### Asset A — Small-Cap Equity
+
+- Quarterly earnings released **twice per day** as structured news
+- Pricing: `price_A = P/E × EPS` where **P/E is constant at 10**
+- Simple: just track EPS from earnings announcements and multiply by 10
+
+#### Asset B — Options on Semiconductor Stock
+
+- **One underlying path** for B per round
+- No direct pricing information for B itself — focus on the **options**
+- Quoted prices for **European** option chain across 3 strikes at each tick
+- Options can **only be exercised at expiration** (not American-style)
+- **Put-Call Parity (PCP):** `C − P = S − K·e^(−rT)` where C/P are call/put prices, S is spot, K is strike, r is risk-free rate, T is time to expiry
+- A long call + short put at the same strike replicates a long forward
+- If PCP is violated → **riskless arbitrage** opportunity
+- **Box Spread:** Bull call spread + bear put spread at strikes K₁ < K₂. Payoff is always K₂ − K₁ regardless of underlying. If the box price ≠ PV of (K₂ − K₁) → arbitrage.
+
+#### Asset C — Insurance Company (Bond + Business)
+
+C's P/E ratio is **NOT constant** — it is inversely proportional to expected bond yields.
+
+**Operating price (business component):**
+```
+P_t^op = EPS_t · PE_t
+PE_t = PE_0 · exp(−γ · (y_t − y_0))
+```
+
+**Bond portfolio component (Taylor expansion):**
+```
+ΔB_t ≈ B_0 · (−D·Δy_t + (1/2)·C·(Δy_t)²)
+```
+where D = duration, C = convexity constants.
+
+**Combined price of C:**
+```
+P_t = EPS_t · PE_t + λ · (ΔB_t / N) + noise
+```
+where N = number of outstanding shares, λ = weighting constant.
+
+- Earnings news **twice per day** (at seconds 22 and 88 of each 90-second day)
+- News includes structured (Forecasted vs Actual CPI) and unstructured (headlines)
+
+#### Prediction Markets (R_CUT, R_HOLD, R_HIKE)
+
+- Predict what the hypothetical Fed will do with rates: **hike (+25 bps), hold (0), or cut (−25 bps)**
+- Quoted probabilities for each outcome provided
+- Structured news: **Forecasted vs Actual CPI** prints. Actual > Forecasted → inflation → points toward rate hikes. Vice versa → rate cuts.
+- Unstructured news: headlines that may or may not relate to the Fed's decision
+
+**Expected rate change:**
+```
+E[Δr_t] = (+25)·q_t^hike + (0)·q_t^hold + (−25)·q_t^cut
+```
+
+**Yield update:**
+```
+y_t = y_0 + β_y · E[Δr_t]
+```
+
+#### ETF
+
+- ETF = **1 share each** of A, B, and C
+- Creation/redemption: swap between 1 ETF share ↔ 1 share each of A, B, C (small fee)
+- Can also swap short (sell ETF, buy components) for a small fee
+- Settlement price = **NAV (fair value)**
+- Hint from case packet: when ETF and equity prices disagree, it's **more likely the ETF is mispriced**
+
+### Revealed Model Parameters
+
+```python
+# For pricing C (bond instrument) and prediction markets
+Y0       = 0.045    # Initial yield
+PE0      = 14.0     # Initial P/E for C (NOT for A; A's P/E = 10 always)
+EPS0     = 2.00     # Initial EPS for C
+GAMMA    = ???      # γ — PE sensitivity to yield changes (not yet revealed)
+BETA_Y   = ???      # β_y — yield sensitivity to expected rate change (not yet revealed)
+D        = ???      # Duration of C's bond portfolio (not yet revealed)
+CONVEX   = ???      # Convexity of C's bond portfolio (not yet revealed)
+B0       = ???      # Initial bond portfolio value (not yet revealed)
+N        = ???      # Number of outstanding shares for C (not yet revealed)
+LAMBDA   = ???      # λ — weighting constant for bond component (not yet revealed)
+```
+
+# Risk Limits
+  A:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B_C_950:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B_P_950:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B_C_1000:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B_P_1000:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B_C_1050:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B_P_1050:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  C:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  ETF:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  R_CUT:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  R_HOLD:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  R_HIKE:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+
+> **NOTE:** Several parameters are marked `???` — they may be revealed on competition day or via Ed posts. Monitor Ed closely.
+
+### Key Strategies (from case packet)
+
+1. **Provide Liquidity:** Post continuous bid/ask quotes. Spread = payment for risk. Think about optimal spread width.
+2. **Manage Risk:** Monitor exposure. Consistent profits score higher than high-variance strategies.
+3. **Strategic Adaptation:** Trade against "dumb" money bots. Smart money bots should inform your price expectations.
+4. **Understand News:** Build a quantitative model for how structured + unstructured news moves prices. Every significant move = some news + some noise.
+5. **Market Impact:** Your trades move prices. Impact depends on overall market liquidity.
+6. **Put-Call Parity Arb:** If calls/puts violate PCP, trade the mispriced leg against a synthetic replication.
+7. **Box Spread Arb:** If box price ≠ PV(K₂ − K₁), arbitrage is available.
+8. **ETF Arb:** When ETF price diverges from NAV, create/redeem. Factor in fees. The ETF is more likely mispriced than the equities.
+9. **Earnings Trading:** If you get info before the market, where to buy/sell? Not always best to post at "new price" — consider adverse selection.
+10. **Asymmetric Quoting:** Adjust quotes if your model fair value diverges from market mid. Consider what happens if only one side gets filled.
+
+### Miscellaneous Tips
+
+- Different strategies work better at different competition stages — adapt between rounds
+- Early rounds: wider spreads, more passive strategies work; Late rounds: need to be faster, more aggressive
+- Consider whether to hold positions to settlement or pay to exit risk
+- When to swap short on ETF vs. hold?
+
+---
+
+## Case 2: Portfolio Optimization
+
+### Overview
+
+- **25 assets** grouped into **5 sectors**
+- **5 years** of historical data provided for each asset
+- Given a CSV with **intraday tick prices** (30 ticks per day)
+- Algorithm evaluated on the **12 months** immediately after the training data period
+- **Scored on annual Sharpe ratio:** `Sharpe = sqrt(252) · mean(r_t) / std(r_t)` where r_t = daily returns
+- **Due: 11:59 PM CST Thursday April 9, 2026**
+- Case 2 is run **before** competition day; results announced at the event
+- Code submitted past deadline **will not be accepted**; incomplete/non-compiling code → disqualification (0 points)
+
+### Algorithm Requirements
+
+- Receives price history observed so far each trading day
+- Must output **weights** for each of the 25 assets
+- Weights can be positive, negative, or zero
+- **Sum of absolute weights must be ≤ 1** (if violated, evaluator rescales proportionally)
+- Short positions incur an **annualized borrow cost** (in basis points) × fraction of year per tick
+
+### Evaluation Mechanics
+
+- Uses **intraday** price path, not just daily closes
+- Portfolio return per tick = sum across assets of (weight × asset's simple return derived from log return)
+- Short exposure charged: borrow cost × short exposure × (fraction of year per tick)
+- **Rebalancing at end of each day** from old weights to new weights
+- **Transaction costs** have two parts:
+  1. **Linear:** 0.5 × spread × |Δweight|
+  2. **Quadratic:** 2.5 × spread × (Δweight)²
+- The starter code includes a reference evaluator — **reproduce these mechanics locally**
+
+### Execution Environment
+
+- **Python 3.12** only
+- Available packages: **NumPy, pandas, scikit-learn, SciPy**
+- Additional packages may be requested via Ed
+- You may use any tools/languages for research, but **submitted code must be Python**
+- Test locally before submitting — code that doesn't compile = 0 points
+
+### Educational Concepts (from case packet)
+
+**Markowitz / Mean-Variance Optimization:**
+- Efficient frontier of max-return-for-given-risk portfolios
+- Requires estimates of expected returns and covariance matrix
+- Historical returns are weak predictors of future returns; covariance matrices are more stable
+- Large covariance matrix estimates are numerically unstable → practical difficulties
+
+**Risk Parity Allocation (RPA):**
+- Ignore expected returns; equalize risk contribution from each asset
+- Risk contribution of asset i: `w_i · (Σw)_i / sqrt(w^T · Σ · w)`
+- Less risky assets get more weight; riskier assets get less weight
+- Historical risk contribution is a reliable estimate
+
+**Return Prediction:**
+- Go beyond static allocation — exploit **predictable structure** in the data
+- Key phenomena: **momentum, mean reversion, cross-asset correlations, volatility clustering**
+- The 5-sector structure reflects real economic relationships
+- Cross-sector and within-sector signals can compound into meaningful edges
+- Daily movement ≠ intraday movement — understand both dynamics
+
+### Key Tips (from case packet)
+
+1. **Analyze returns, not prices.** Prices are non-stationary; returns are generally stationary.
+2. **Don't test on training data.** Hold out a portion for out-of-sample validation. Overfitting kills you.
+3. **Daily vs. intraday are different processes.** Portfolio optimization trades off short-term volatility with long-term predictability.
+4. **Transaction costs matter.** Frequent rebalancing must justify its additional cost vs. lower-frequency approaches.
+5. **Starter code is for understanding only** — do NOT take it as predictive of your final score.
+
+---
+
+## Code & Repo Conventions
+
+### General
+
+- Python 3.12 for all code
+- Use type hints where practical
+- Keep bot code modular: separate pricing logic, order management, risk management
+- All magic numbers should be named constants at the top of the file
+
+### Risk Limit Constants (update these on competition day)
+
+```python
+# --- RISK LIMITS (update from Ed post before competition) ---
+MAX_ORDER_SIZE         = 40
+MAX_OPEN_ORDERS        = 50
+MAX_OUTSTANDING_VOLUME = 120
+MAX_ABSOLUTE_POSITION  = 200
+```
+
+### Model Parameters (update as revealed)
+
+```python
+# --- MODEL PARAMETERS ---
+# Asset A
+A_PE_RATIO = 10.0  # Constant
+
+# Asset C & Prediction Markets
+Y0         = 0.045   # Initial yield
+PE0_C      = 14.0    # Initial P/E for C
+EPS0_C     = 2.00    # Initial EPS for C
+GAMMA      = None    # PE sensitivity to yield (TBD)
+BETA_Y     = None    # Yield sensitivity to rate change (TBD)
+DURATION   = None    # Bond portfolio duration (TBD)
+CONVEXITY  = None    # Bond portfolio convexity (TBD)
+B0_BONDS   = None    # Initial bond portfolio value (TBD)
+N_SHARES   = None    # Outstanding shares for C (TBD)
+LAMBDA_W   = None    # Bond component weighting (TBD)
+
+# News schedule: earnings at seconds 22 and 88 of each 90-second day
+NEWS_SECONDS = [22, 88]
+```
+
+### Pre-Competition Checklist
+
+- [ ] Reinstall latest `utcxchangelib`
+- [ ] Verify bot connects to practice exchange
+- [ ] Update risk limits from Ed post
+- [ ] Update any newly revealed model parameters
+- [ ] Test SSH into AWS EC2 box
+- [ ] Ensure one team member can manually start the bot
+- [ ] Case 2 code submitted by 11:59 PM CST April 9
+- [ ] Test Case 2 code compiles and runs with Python 3.12 + numpy/pandas/sklearn/scipy only
+- [ ] Verify Case 2 evaluator runs locally without errors
+
+---
+
+## Quick Reference: Key Formulas
+
+### Asset A
+```
+Price_A = 10 × EPS_A
+```
+
+### Asset C — Operating Component
+```
+PE_t = PE_0 · exp(−γ · (y_t − y_0))
+P_t^op = EPS_t · PE_t
+```
+
+### Asset C — Bond Component
+```
+ΔB_t ≈ B_0 · (−D · Δy_t + 0.5 · C · (Δy_t)²)
+```
+
+### Asset C — Combined
+```
+P_C = EPS_t · PE_t + λ · (ΔB_t / N) + noise
+```
+
+### Yield from Prediction Markets
+```
+E[Δr_t] = 25 · q_hike + 0 · q_hold − 25 · q_cut
+y_t = y_0 + β_y · E[Δr_t]
+```
+
+### Put-Call Parity (European)
+```
+C − P = S − K · e^(−rT)
+```
+
+### Box Spread (strikes K₁ < K₂)
+```
+Fair value of box = (K₂ − K₁) · e^(−rT)
+```
+
+### Sharpe Ratio (Case 2)
+```
+Sharpe = sqrt(252) · mean(r_t) / std(r_t)
+```
+
+### Portfolio Variance
+```
+σ²_p = Σ_i Σ_j w_i · w_j · Cov(r_i, r_j)
+```
+
+### Transaction Cost (Case 2 rebalancing)
+```
+cost = 0.5 · spread · |Δw| + 2.5 · spread · (Δw)²
+```

@@ -1,0 +1,65 @@
+  A:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B_C_950:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B_P_950:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B_C_1000:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B_P_1000:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B_C_1050:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  B_P_1050:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  C:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  ETF:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  R_CUT:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  R_HOLD:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
+  R_HIKE:
+    max_order_size: 40
+    max_open_orders: 50
+    max_outstanding_volume: 120
+    max_absolute_position: 200
