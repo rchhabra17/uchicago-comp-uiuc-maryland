@@ -156,6 +156,8 @@ class MyStrategy(StrategyBase):
     EWMA_HALF_LIFE: float = 20.0   # EWMA half-life in days
     MIN_DELTA: float = 0.002       # skip rebalance if total |Δw| below this
     MIN_HISTORY_DAYS: int = 60     # need enough history for signal computation
+    VOL_REGIME_LB: int = 120       # lookback for long-term vol regime
+    INTRADAY_WEIGHT: float = 0.1   # weight of intraday vol penalization
 
     def __init__(self) -> None:
         self._last_weights: np.ndarray = _EW.copy()
@@ -170,7 +172,8 @@ class MyStrategy(StrategyBase):
         daily_rets = np.diff(np.log(np.maximum(daily_close, 1e-12)), axis=0)
 
         if daily_rets.shape[0] >= self.MIN_HISTORY_DAYS:
-            self._last_weights = self._build_target(daily_rets)
+            intraday_sig = self._intraday_vol_signal(train_prices)
+            self._last_weights = self._build_target(daily_rets, intraday_sig)
 
     def get_weights(
         self, price_history: np.ndarray, meta: PublicMeta, day: int
@@ -194,7 +197,8 @@ class MyStrategy(StrategyBase):
             return self._last_weights.copy()
 
         daily_rets = np.diff(np.log(np.maximum(daily_close, 1e-12)), axis=0)
-        target = self._build_target(daily_rets)
+        intraday_sig = self._intraday_vol_signal(price_history)
+        target = self._build_target(daily_rets, intraday_sig)
 
         if np.sum(np.abs(target - self._last_weights)) < self.MIN_DELTA:
             return self._last_weights.copy()
@@ -202,18 +206,54 @@ class MyStrategy(StrategyBase):
         self._last_weights = target
         return target
 
-    def _build_target(self, daily_rets: np.ndarray) -> np.ndarray:
+    def _intraday_vol_signal(self, tick_prices: np.ndarray) -> np.ndarray:
+        n_ticks = tick_prices.shape[0]
+        n_days = n_ticks // self._tpd
+        n_assets = tick_prices.shape[1]
+
+        if n_days < 20:
+            return np.zeros(n_assets)
+
+        reshaped = tick_prices[:n_days * self._tpd].reshape(n_days, self._tpd, -1)
+        lookback = min(20, n_days)
+        recent = reshaped[-lookback:]
+        intraday_rets = np.diff(np.log(np.maximum(recent, 1e-12)), axis=1)
+        
+        daily_intraday_vol = intraday_rets.std(axis=1)  # (days, assets)
+        avg_vol = daily_intraday_vol.mean(axis=0)  # (assets,)
+        
+        signal = -avg_vol
+        signal = (signal - signal.mean()) / max(signal.std(), 1e-10)
+        return signal
+
+    def _build_target(self, daily_rets: np.ndarray, intraday_sig: np.ndarray | None = None) -> np.ndarray:
         """Compute target weights: sector Sharpe tilt + EWMA vol targeting."""
-        # Sector Sharpe signal → tilt from equal weight
         sig = sector_sharpe_signal(daily_rets, self._sector_ids, self.LOOKBACK)
+        
+        if intraday_sig is not None and self.INTRADAY_WEIGHT > 0:
+            sig = (1 - self.INTRADAY_WEIGHT) * sig + self.INTRADAY_WEIGHT * intraday_sig
+            
         target = tilt_weights(_EW, sig, scale=self.SIGNAL_SCALE)
 
-        # EWMA vol targeting: scale exposure so portfolio vol ≈ TARGET_VOL
-        if daily_rets.shape[0] >= self.VOL_LOOKBACK:
+        if daily_rets.shape[0] >= self.VOL_REGIME_LB:
+            ew_rets = daily_rets @ _EW
+            short_vol = np.std(ew_rets[-self.VOL_LOOKBACK:]) * np.sqrt(252)
+            long_vol = np.std(ew_rets[-self.VOL_REGIME_LB:]) * np.sqrt(252)
+
+            vol_ratio = short_vol / max(long_vol, 1e-10)
+            adaptive_tv = self.TARGET_VOL * (1.0 / max(vol_ratio, 0.5))
+            adaptive_tv = np.clip(adaptive_tv, 0.05, 0.18)
+
             port_rets = daily_rets[-self.VOL_LOOKBACK:] @ target
-            port_vol = ewma_vol(port_rets, self.EWMA_HALF_LIFE) * np.sqrt(252)
-            if port_vol > 1e-6:
-                scale = min(self.TARGET_VOL / port_vol, 1.0)
+            pvol = ewma_vol(port_rets, self.EWMA_HALF_LIFE) * np.sqrt(252)
+            if pvol > 1e-6:
+                scale = min(adaptive_tv / pvol, 1.0)
+                target = target * scale
+        elif daily_rets.shape[0] >= self.VOL_LOOKBACK:
+            port_rets = daily_rets[-self.VOL_LOOKBACK:] @ target
+            pvol = ewma_vol(port_rets, self.EWMA_HALF_LIFE) * np.sqrt(252)
+            if pvol > 1e-6:
+                scale = min(self.TARGET_VOL / pvol, 1.0)
                 target = target * scale
 
         return enforce_gross_limit(target, 1.0)
