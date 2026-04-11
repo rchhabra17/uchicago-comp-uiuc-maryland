@@ -1,0 +1,18 @@
+news_tick,wall_time_s,news_type,symbol,content_or_value,pre_mid,mid_1s,mid_3s,mid_5s,mid_10s
+171,1775872980.1129842,UNSTRUCTURED,None,Minutes show several members open to additional tightening if needed.,1246.0,1245.5,1237.0,1241.5,1231.5
+499,1775873045.7120142,UNSTRUCTURED,None,"Economic signals remain contradictory, keeping the committee in wait-and-see mode.",1013.5,1015.0,1014.0,1016.5,1022.5
+949,1775873135.712532,UNSTRUCTURED,None,Officials describe current policy as appropriate given the uncertain outlook.,1010.5,1010.0,1015.0,1017.5,1023.0
+1071,1775873160.112385,UNSTRUCTURED,None,Officials describe current policy as appropriate given the uncertain outlook.,1005.0,1012.5,1015.0,1013.0,1023.5
+1176,1775873181.10769,UNSTRUCTURED,A,A receives substantial funding from prominent venture firm.,1007.0,1009.0,1042.5,1077.0,1129.0
+1399,1775873225.714226,UNSTRUCTURED,None,Policymakers warn premature easing could reignite price pressures.,1265.0,1264.0,1255.0,1251.5,1252.0
+1452,1775873236.31357,UNSTRUCTURED,A,Rising operational costs begin to erode profitability at A.,1245.5,1252.0,1249.5,1245.0,1219.0
+1521,1775873250.107254,UNSTRUCTURED,None,Press conference raises more questions than answers on the rate trajectory.,1116.0,1119.5,1124.0,1129.0,1125.0
+1849,1775873315.717644,UNSTRUCTURED,None,Rising unemployment claims add urgency to the case for rate relief.,1185.5,1183.5,1175.0,1195.0,1399.5
+1956,1775873337.107718,UNSTRUCTURED,A,A faces increased competition eroding profitability.,1379.0,1328.0,1303.5,1286.0,1286.0
+2185,1775873382.9050722,UNSTRUCTURED,None,Inflation ticking lower but not fast enough to settle the debate.,1300.5,1296.0,1301.0,1302.0,1286.5
+2299,1775873405.7049038,UNSTRUCTURED,None,Policymakers warn premature easing could reignite price pressures.,1233.0,1234.0,1236.0,1244.0,1232.5
+2635,1775873472.906359,UNSTRUCTURED,None,Officials note downside growth risks; markets lean toward cuts.,1237.0,1237.0,1238.0,1229.5,1249.5
+3085,1775873562.9668858,UNSTRUCTURED,None,Committee members express a wide range of views on the neutral rate.,1340.0,1337.0,1337.0,1339.0,1342.0
+3321,1775873610.102313,UNSTRUCTURED,None,Rising unemployment claims add urgency to the case for rate relief.,1108.0,1109.0,1108.0,1106.0,1100.0
+3535,1775873652.909538,UNSTRUCTURED,None,Strong payrolls data reinforces expectation that policy will stay firm.,1108.5,1116.5,1143.0,1168.0,1211.5
+3771,1775873700.1168,UNSTRUCTURED,None,Softening data raises expectations of policy easing.,1039.0,1037.0,1019.5,1022.0,1016.5

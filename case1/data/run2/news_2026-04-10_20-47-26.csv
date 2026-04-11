@@ -1,0 +1,17 @@
+news_tick,wall_time_s,news_type,symbol,content_or_value,pre_mid,mid_1s,mid_3s,mid_5s,mid_10s
+376,1775872105.881002,UNSTRUCTURED,None,Rising unemployment claims add urgency to the case for rate relief.,1224.0,1226.0,1226.0,1221.0,1223.0
+627,1775872156.071615,UNSTRUCTURED,None,Policymakers note that real rates are well above neutral estimates.,1279.5,1278.0,1277.0,1279.0,1268.5
+826,1775872195.876032,UNSTRUCTURED,None,Officials describe current policy as appropriate given the uncertain outlook.,1161.0,1162.5,1178.0,1172.0,1162.0
+942,1775872219.070528,UNSTRUCTURED,None,Press conference raises more questions than answers on the rate trajectory.,1150.0,,1340.0,1357.0,1364.0
+1726,1775872375.8713,UNSTRUCTURED,None,Officials note that both upside and downside scenarios remain plausible.,1080.0,1080.5,1080.5,1084.0,1085.0
+1842,1775872399.073736,UNSTRUCTURED,None,Officials note that both upside and downside scenarios remain plausible.,1256.0,1270.0,1283.0,1290.5,1296.0
+1977,1775872426.071852,UNSTRUCTURED,None,"Wage growth decelerating, easing a key concern for policymakers.",1286.0,1287.0,1278.5,1284.0,1282.0
+2176,1775872465.8698409,UNSTRUCTURED,None,"Policymakers split on the outlook, with no consensus on timing of next move.",1169.0,1168.0,1171.5,1170.0,1179.5
+2363,1775872503.272177,UNSTRUCTURED,A,Corporate transparency and accountability earn A wide praise.,1221.0,1221.0,1217.0,1224.0,1259.0
+2742,1775872579.075839,UNSTRUCTURED,None,Central bank officials express discomfort with above-target inflation readings.,1171.0,1171.5,1177.5,1172.5,1174.0
+3076,1775872645.870795,UNSTRUCTURED,None,"Manufacturing contraction deepens, adding to evidence of economic softening.",1307.0,1303.0,1311.0,1312.5,1305.0
+3448,1775872720.267141,UNSTRUCTURED,A,A significant profitability increase is revealed in A’s latest earnings release.,1076.5,1079.0,1080.0,1078.0,1123.5
+3526,1775872735.878317,UNSTRUCTURED,None,"Manufacturing contraction deepens, adding to evidence of economic softening.",1361.0,1354.0,1359.5,1372.0,1349.0
+3642,1775872759.0808,UNSTRUCTURED,None,Labor data and inflation readings point in different directions for policy.,1215.0,1214.0,1215.5,1212.0,1198.5
+4092,1775872849.0712929,UNSTRUCTURED,None,Strong GDP paired with falling inflation complicates the policy calculus.,1161.0,1166.0,1162.5,1157.5,1157.0
+4359,1775872902.4697118,UNSTRUCTURED,A,Analysts label A’s strategic pivot as largely ineffective.,1151.0,1140.0,1128.0,1125.0,1122.0

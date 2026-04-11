@@ -1,0 +1,18 @@
+news_tick,wall_time_s,news_type,symbol,content_or_value,pre_mid,mid_1s,mid_3s,mid_5s,mid_10s
+50,1775752971.136645,UNSTRUCTURED,None,Officials emphasize balanced risks amid mixed economic indicators.,1184.0,1186.0,1186.5,1188.0,1179.0
+825,1775753126.1301372,UNSTRUCTURED,None,Officials emphasize balanced risks amid mixed economic indicators.,1232.0,1231.0,1240.0,1238.5,1229.5
+950,1775753151.1334321,UNSTRUCTURED,None,Officials emphasize balanced risks amid mixed economic indicators.,1225.0,1226.5,1229.5,1235.0,1240.0
+1431,1775753247.335954,UNSTRUCTURED,A,A suffers from declining consumer brand perception.,1265.0,1281.0,1260.5,1173.0,
+1525,1775753266.1371,UNSTRUCTURED,None,Officials emphasize balanced risks amid mixed economic indicators.,1105.5,1108.0,1164.5,1148.5,1138.0
+1725,1775753306.139103,UNSTRUCTURED,None,Officials signal policy may stay restrictive for longer than expected.,1196.5,1197.0,1197.0,1193.0,1201.5
+1850,1775753331.130103,UNSTRUCTURED,None,Officials emphasize balanced risks amid mixed economic indicators.,1187.0,1194.0,1194.0,1204.0,1189.0
+1858,1775753332.7278578,UNSTRUCTURED,A,Efforts to execute an ambitious turnaround plan fall flat for A.,1196.0,1193.0,1197.0,1199.0,1187.0
+1975,1775753356.154859,UNSTRUCTURED,None,Officials emphasize balanced risks amid mixed economic indicators.,1171.0,1170.0,1172.5,1176.0,1171.0
+2175,1775753396.131287,UNSTRUCTURED,None,Officials emphasize balanced risks amid mixed economic indicators.,1082.0,1078.5,1081.0,1081.0,1094.0
+2300,1775753421.133607,UNSTRUCTURED,None,Softening data raises expectations of policy easing.,1089.0,1098.5,1102.0,1104.5,1084.0
+2329,1775753426.928875,UNSTRUCTURED,A,A major defense sector contract is awarded to A.,1105.0,1098.0,1084.0,1091.0,1110.5
+2625,1775753486.137321,UNSTRUCTURED,None,Officials signal policy may stay restrictive for longer than expected.,1001.5,1009.0,1009.5,1004.0,998.0
+3200,1775753601.132412,UNSTRUCTURED,None,Officials emphasize balanced risks amid mixed economic indicators.,1080.0,1083.0,1074.0,1078.0,1072.0
+3325,1775753626.140064,UNSTRUCTURED,None,Officials emphasize balanced risks amid mixed economic indicators.,1056.0,1037.0,1021.0,1038.5,1033.5
+3775,1775753716.137145,UNSTRUCTURED,None,Officials signal policy may stay restrictive for longer than expected.,1163.0,1161.0,1160.5,,1068.5
+3998,1775753760.758898,UNSTRUCTURED,A,A loses exclusive rights to flagship technology patent.,1171.5,1173.5,1165.0,1176.0,1048.5
