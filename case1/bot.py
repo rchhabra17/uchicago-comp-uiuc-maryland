@@ -1,6 +1,7 @@
 from typing import Optional
 from utcxchangelib import XChangeClient, Side
 import asyncio
+import time
 import config
 from fair_value import FairValueEngine
 from risk import RiskManager
@@ -17,6 +18,12 @@ from options import (
     find_stale_orders,
     detect_butterfly_orders,
     detect_vertical_orders,
+    option_delta,
+    option_delta_bs,
+    compute_implied_vols,
+    find_near_expiry_orders,
+    bs_call_price,
+    bs_put_price,
 )
 
 class MyXchangeClient(XChangeClient):
@@ -27,6 +34,20 @@ class MyXchangeClient(XChangeClient):
         self.risk = RiskManager()
         self.pnl = 0
         self.b_cash = 0.0
+        self.round_start_time: float = time.time()
+        self.current_sigma: Optional[float] = None
+        self._last_fair_b: Optional[float] = None   # cached fair_b for sparse books
+
+        # Per-slot MM order tracking: {sym -> {"BUY": order_id, "SELL": order_id,
+        #                                       "bid_px": int, "ask_px": int}}
+        self._mm_slots: dict = {}
+        # Snipe order IDs to cancel quickly
+        self._snipe_order_ids: set = set()
+        # IV update throttle: only recompute sigma every N book updates
+        self._iv_update_counter: int = 0
+        # MM rate limiter: don't reprice more than once per 200ms
+        self._mm_last_update: float = 0.0
+        self._mm_in_progress: bool = False  # prevent concurrent MM calls
 
         self.b_relevant = {f"B_C_{k}" for k in config.B_STRIKES} | {f"B_P_{k}" for k in config.B_STRIKES} | {"B"}
 
@@ -128,11 +149,9 @@ class MyXchangeClient(XChangeClient):
             book = self.order_books.get(sym)
             quotes[sym] = best_bid_ask(book) if book else (None, None)
 
-        # [TOGGLE START] Standard Arbitrage (Box & Parity) Disabled
-        """
         # Tradeable Put-Call Parity
         s_bid, s_ask = quotes["B"]
-        if s_bid is not None or s_ask is not None:
+        if s_bid is not None and s_ask is not None:
             for k in config.B_STRIKES:
                 if self.risk.on_cooldown(f"parity_{k}", config.B_SIGNAL_COOLDOWN):
                     continue
@@ -223,43 +242,88 @@ class MyXchangeClient(XChangeClient):
                 if self.risk.can_trade_b_package(combined, config.B_MAX_POSITION, config.B_MAX_GROSS_FAMILY):
                     orders_to_fire.extend(box_legs)
                     total_changes = combined
-        """
-        # [TOGGLE END]
 
-        # 1. Dead-Leg Trap Strategy
-        for sym in self.b_relevant:
-            # Look for missing bids to trap
-            b_bid, b_ask = quotes[sym]
-            if b_bid is None and b_ask is not None:
-                if self.risk.get_position(sym) < 20: 
-                    # Only place one active trap order at a time per dead leg
-                    open_bids = sum(1 for oid, info in self.open_orders.items() if info[0].symbol == sym and info[0].side == 1)
-                    if open_bids == 0:
-                        orders_to_fire.append((sym, 5, Side.BUY, 1))
+        # 1. Fair value + vol calibration
+        raw_fair_b, is_fresh = compute_fair_b(quotes, config.B_STRIKES)
+        if raw_fair_b is not None:
+            self._last_fair_b = raw_fair_b
+        fair_b = raw_fair_b if raw_fair_b is not None else self._last_fair_b
+        using_cache = (raw_fair_b is None and fair_b is not None)
 
-        # 2. Strategy 1: Stale Sniping
-        fair_b = compute_fair_b(quotes, config.B_STRIKES)
         if fair_b is not None:
+            T = self.get_T()
+
+            # Sigma: recompute IV every book update for fastest reaction
+            _, median_iv = compute_implied_vols(quotes, fair_b, T, config.B_STRIKES)
+            if median_iv is not None:
+                if self.current_sigma is None:
+                    self.current_sigma = median_iv
+                else:
+                    self.current_sigma = 0.7 * median_iv + 0.3 * self.current_sigma
+
+            # 3. Market-make: requote all options inline (fastest possible — on every book event)
+            if self.current_sigma is not None:
+                await self._update_mm_quotes(fair_b, T, self.current_sigma, is_fresh and not using_cache)
+
+            # 4. Stale sniping
+            snipe_edge = config.B_SWEEP_EDGE if (is_fresh and not using_cache) else config.B_SWEEP_EDGE * 2.0
             if not self.risk.on_cooldown("snipe", 0.2):
-                stale_orders = find_stale_orders(quotes, fair_b, config.B_STRIKES, config.B_SWEEP_EDGE, config.B_SNIPE_ORDER_SIZE)
-                if stale_orders:
-                    # Filter snipes through risk checks
-                    for sym, qty, side, price in stale_orders:
-                        delta = qty if side == Side.BUY else -qty
-                        combined = total_changes.copy()
-                        combined[sym] = combined.get(sym, 0) + delta
-                        if self.risk.can_trade_b_package(combined, config.B_MAX_POSITION, config.B_MAX_GROSS_FAMILY):
-                            orders_to_fire.append((sym, qty, side, price))
-                            total_changes = combined
+                # Pass T and sigma to snipe so it uses BS fair values when available
+                stale_orders = find_stale_orders(
+                    quotes, fair_b, config.B_STRIKES, snipe_edge,
+                    config.B_SNIPE_ORDER_SIZE, T=T, sigma=self.current_sigma
+                )
+                for sym, qty, side, price in stale_orders:
+                    delta = qty if side == Side.BUY else -qty
+                    combined = total_changes.copy()
+                    combined[sym] = combined.get(sym, 0) + delta
+                    if self.risk.can_trade_b_package(combined, config.B_MAX_POSITION, config.B_MAX_GROSS_FAMILY):
+                        orders_to_fire.append((sym, qty, side, price))
+                        total_changes = combined
+
+            # Near-expiry: sell OTM options still carrying time premium
+            if T < config.B_NEAR_EXPIRY_FRACTION:
+                ne_orders = find_near_expiry_orders(
+                    quotes, fair_b, T, config.B_STRIKES,
+                    config.B_NEAR_EXPIRY_SIZE, config.B_NEAR_EXPIRY_BUFFER
+                )
+                for sym, qty, side, price in ne_orders:
+                    delta = qty if side == Side.BUY else -qty
+                    combined = total_changes.copy()
+                    combined[sym] = combined.get(sym, 0) + delta
+                    if self.risk.can_trade_b_package(combined, config.B_MAX_POSITION, config.B_MAX_GROSS_FAMILY):
+                        orders_to_fire.append((sym, qty, side, price))
+                        total_changes = combined
 
         if orders_to_fire:
+            if not hasattr(self, "_snipe_order_ids"):
+                self._snipe_order_ids = set()
+            T_log = self.get_T()
             for sym, qty, side, price in orders_to_fire:
-                tag = "TRAP" if price == 1 else "SNIPE"
-                print(f"[{tag}] {sym} {side} {qty}@{price}")
-            await asyncio.gather(*[
-                self.place_order(sym, qty, side, price)
-                for sym, qty, side, price in orders_to_fire
-            ])
+                if T_log < config.B_NEAR_EXPIRY_FRACTION and side == Side.SELL:
+                    tag = "EXPIRY"
+                else:
+                    tag = "SNIPE"
+                print(f"[{tag}] {sym} {side} {qty}@{price} T={T_log:.3f}")
+            for sym, qty, side, price in orders_to_fire:
+                oid = await self.place_order(sym, qty, side, price)
+                if isinstance(oid, str):
+                    self._snipe_order_ids.add(oid)
+
+        # Inline delta hedge — only when significantly imbalanced, 3s cooldown to avoid churn
+        if fair_b is not None and not self.risk.on_cooldown("delta_hedge", 3.0):
+            net_delta = self.compute_net_delta(fair_b)
+            if abs(net_delta) > config.B_DELTA_THRESHOLD:
+                if net_delta > 0:
+                    b_bid = quotes["B"][0] if quotes.get("B") else None
+                    if b_bid and self.risk.can_trade("B", "SELL", config.B_DELTA_HEDGE_SIZE, config.B_MAX_POSITION["B"]):
+                        print(f"[DELTA HEDGE] SELL {config.B_DELTA_HEDGE_SIZE} B @ {b_bid} (net_delta={net_delta:.2f})")
+                        await self.place_order("B", config.B_DELTA_HEDGE_SIZE, Side.SELL, b_bid)
+                else:
+                    b_ask = quotes["B"][1] if quotes.get("B") else None
+                    if b_ask and self.risk.can_trade("B", "BUY", config.B_DELTA_HEDGE_SIZE, config.B_MAX_POSITION["B"]):
+                        print(f"[DELTA HEDGE] BUY {config.B_DELTA_HEDGE_SIZE} B @ {b_ask} (net_delta={net_delta:.2f})")
+                        await self.place_order("B", config.B_DELTA_HEDGE_SIZE, Side.BUY, b_ask)
 
 
     async def calibrate_after_delay(self, symbol, eps):
@@ -407,6 +471,25 @@ class MyXchangeClient(XChangeClient):
     async def bot_handle_settlement_payout(self, user: str, market_id: str, amount: int, tick: int):
         print(f"Settlement payout: {amount} from {market_id}")
 
+    def get_T(self) -> float:
+        """Fraction of round remaining: 1.0 at start, 0.0 at expiry."""
+        elapsed = time.time() - self.round_start_time
+        return max(0.0, 1.0 - elapsed / config.TOTAL_ROUND_SECONDS)
+
+    def compute_net_delta(self, fair_b: float) -> float:
+        """Sum delta contributions from all option positions + B stock (delta=1 per share)."""
+        T = self.get_T()
+        sigma = self.current_sigma
+        # B stock contributes delta 1.0 per share
+        net = float(self.risk.get_position("B"))
+        for sym in self.b_relevant:
+            if sym == "B":
+                continue
+            pos = self.risk.get_position(sym)
+            if pos != 0:
+                net += pos * option_delta_bs(sym, fair_b, T, sigma if sigma else 0.0)
+        return net
+
     async def trade_loop(self):
         while True:
             await asyncio.sleep(5)
@@ -443,33 +526,169 @@ class MyXchangeClient(XChangeClient):
             #     else:
             #         await self.quote_around(symbol, fair)
 
-            # PNL logging (unchanged)
-            # cash = self.positions.get("cash", 0)
-            # pos_a = self.positions.get("A", 0)
-            # fair_a = self.fair_value.get("A") or 0
-            # mark_to_market = cash + (pos_a * fair_a)
-            # print(f"[PNL] cash={cash} | pos_A={pos_a} | mtm={mark_to_market:.0f}")
+            # Delta flattening: if net options delta is too far from zero, hedge with B stock
+            quotes = {}
+            for sym in self.b_relevant:
+                book = self.order_books.get(sym)
+                quotes[sym] = best_bid_ask(book) if book else (None, None)
 
-            # print B MTM
-            # print(f"[B MTM] {self.compute_b_mtm():.2f}")
+            raw_fair_b, _ = compute_fair_b(quotes, config.B_STRIKES)
+            fair_b = raw_fair_b if raw_fair_b is not None else self._last_fair_b
+            if fair_b is not None:
+                net_delta = self.compute_net_delta(fair_b)
+                b_pos = self.risk.get_position("B")
+                print(f"[DELTA] net_delta={net_delta:.2f} b_pos={b_pos}")
+
+                if net_delta > config.B_DELTA_THRESHOLD:
+                    # Net long delta — sell B to flatten
+                    b_bid = quotes["B"][0] if quotes.get("B") else None
+                    if b_bid and self.risk.can_trade("B", "sell", config.B_DELTA_HEDGE_SIZE, config.B_MAX_POSITION["B"]):
+                        print(f"[DELTA HEDGE] SELL {config.B_DELTA_HEDGE_SIZE} B @ {b_bid} (net_delta={net_delta:.2f})")
+                        await self.place_order("B", config.B_DELTA_HEDGE_SIZE, Side.SELL, b_bid)
+
+                elif net_delta < -config.B_DELTA_THRESHOLD:
+                    # Net short delta — buy B to flatten
+                    b_ask = quotes["B"][1] if quotes.get("B") else None
+                    if b_ask and self.risk.can_trade("B", "buy", config.B_DELTA_HEDGE_SIZE, config.B_MAX_POSITION["B"]):
+                        print(f"[DELTA HEDGE] BUY {config.B_DELTA_HEDGE_SIZE} B @ {b_ask} (net_delta={net_delta:.2f})")
+                        await self.place_order("B", config.B_DELTA_HEDGE_SIZE, Side.BUY, b_ask)
+
             self.print_b_pnl()
 
-    async def arb_cleanup_loop(self):
-        """Scrub lingering unfilled leg fragments to prevent Outstanding Volume breaches and stale directional fills."""
+    async def _update_mm_quotes(self, fair_b: float, T: float, sigma: float, data_fresh: bool):
+        """
+        Inline MM requoter — called on book updates, throttled to 200ms minimum interval.
+        Per-slot tracking means we only cancel+replace quotes where fair moved > REPRICE_THRESHOLD.
+        We fire the cancel and the new order concurrently — no waiting for cancel confirmation.
+        Dynamic spread: tighter when data is fresh, wider when using stale/cached fair_b.
+        """
+        now = time.time()
+        if self._mm_in_progress or (now - self._mm_last_update) < 0.15:
+            return
+        self._mm_in_progress = True
+        self._mm_last_update = now
+
+        REPRICE_THRESHOLD = 1
+        # Widen spread when fair_b is moving fast (trend protection)
+        fair_b_move = abs(fair_b - self._last_mm_fair_b) if hasattr(self, '_last_mm_fair_b') and self._last_mm_fair_b else 0
+        self._last_mm_fair_b = fair_b
+        trend_widen = min(4, int(fair_b_move / 3))  # +1 tick spread per 3pt move in B
+        half_spread = config.B_MM_HALF_SPREAD + trend_widen
+        if not data_fresh:
+            half_spread += 2
+
+        ops = []  # list of (cancel_id_or_None, sym, qty, side, px, side_key)
+
+        for k in config.B_STRIKES:
+            for is_call in [True, False]:
+                sym = f"B_C_{k}" if is_call else f"B_P_{k}"
+                pos = self.risk.get_position(sym)
+                lim = config.B_MAX_POSITION.get(sym, 20)
+
+                fair = bs_call_price(fair_b, k, T, sigma) if is_call else bs_put_price(fair_b, k, T, sigma)
+                if fair < config.B_MM_MIN_PRICE:
+                    continue
+
+                skew = max(-config.B_MM_MAX_SKEW,
+                           min(config.B_MM_MAX_SKEW, -pos * config.B_MM_SKEW_PER_UNIT))
+
+                new_bid = max(1, int(fair + skew - half_spread))
+                new_ask = max(new_bid + 1, int(fair + skew + half_spread))
+
+                slot = self._mm_slots.get(sym, {})
+
+                # BID side
+                old_bid_px = slot.get("bid_px")
+                if pos < lim and self.risk.can_trade_b_package({sym: config.B_MM_ORDER_SIZE},
+                                                                config.B_MAX_POSITION,
+                                                                config.B_MAX_GROSS_FAMILY):
+                    if old_bid_px is None or new_bid != old_bid_px:
+                        cancel_id = slot.get("BUY")
+                        if cancel_id and cancel_id not in self.open_orders:
+                            cancel_id = None
+                        ops.append((cancel_id, sym, config.B_MM_ORDER_SIZE, Side.BUY, new_bid, "BUY"))
+                        self._mm_slots.setdefault(sym, {})["bid_px"] = new_bid
+
+                # ASK side
+                old_ask_px = slot.get("ask_px")
+                if pos > -lim and self.risk.can_trade_b_package({sym: -config.B_MM_ORDER_SIZE},
+                                                                 config.B_MAX_POSITION,
+                                                                 config.B_MAX_GROSS_FAMILY):
+                    if old_ask_px is None or new_ask != old_ask_px:
+                        cancel_id = slot.get("SELL")
+                        if cancel_id and cancel_id not in self.open_orders:
+                            cancel_id = None
+                        ops.append((cancel_id, sym, config.B_MM_ORDER_SIZE, Side.SELL, new_ask, "SELL"))
+                        self._mm_slots.setdefault(sym, {})["ask_px"] = new_ask
+
+        try:
+            if not ops:
+                return
+
+            # Interleaved cancel→place per slot: new quote live ASAP
+            for cancel_id, sym, qty, side, px, side_key in ops:
+                if cancel_id:
+                    await self.cancel_order(cancel_id)
+                oid = await self.place_order(sym, qty, side, px)
+                if isinstance(oid, str):
+                    self._mm_slots.setdefault(sym, {})[side_key] = oid
+        finally:
+            self._mm_in_progress = False
+
+    async def b_mm_loop(self):
+        """
+        Heartbeat: forces a full MM requote every 10s.
+        Handles cold-start (before sigma calibrated) and catches stale quotes
+        when book updates are sparse. Main MM work is inline in bot_handle_book_update.
+        """
         while True:
-            await asyncio.sleep(0.5)  # Sweep every 500ms
-            to_cancel = []
-            for oid, info in list(self.open_orders.items()):
-                if info[0].symbol in self.b_relevant:
-                    is_market = info[2]
-                    price = info[0].limit.px if not is_market else -1
-                    if price != 1:
-                        to_cancel.append(oid)
-            if to_cancel:
-                await asyncio.gather(*[self.cancel_order(oid) for oid in to_cancel])
+            await asyncio.sleep(10)
+            quotes = {}
+            for sym in self.b_relevant:
+                book = self.order_books.get(sym)
+                quotes[sym] = best_bid_ask(book) if book else (None, None)
+            raw_fb, _ = compute_fair_b(quotes, config.B_STRIKES)
+            if raw_fb is not None:
+                self._last_fair_b = raw_fb
+            fair_b = raw_fb if raw_fb is not None else self._last_fair_b
+            if fair_b is None:
+                continue
+            T = self.get_T()
+            if self.current_sigma is None:
+                _, med_iv = compute_implied_vols(quotes, fair_b, T, config.B_STRIKES)
+                if med_iv is not None:
+                    self.current_sigma = med_iv
+            if self.current_sigma is not None and T > 1e-4:
+                # Force full reprice by clearing stale slot prices
+                for sym in list(self._mm_slots.keys()):
+                    self._mm_slots[sym].pop("bid_px", None)
+                    self._mm_slots[sym].pop("ask_px", None)
+                await self._update_mm_quotes(fair_b, T, self.current_sigma, True)
+                print(f"[MM HEARTBEAT] fair_b={fair_b:.0f} sigma={self.current_sigma:.3f} T={T:.3f}")
+
+    async def arb_cleanup_loop(self):
+        """
+        Cancel stale snipe orders quickly (they should fill immediately or not at all).
+        MM quotes are managed by b_mm_loop — don't touch those.
+        Trap orders at price=1 are permanent — don't touch those either.
+        A snipe order is identified by being placed within the last 2 seconds
+        and not matching any current MM quote price.
+        We track snipe order IDs in self._snipe_order_ids.
+        """
+        if not hasattr(self, "_snipe_order_ids"):
+            self._snipe_order_ids = set()
+        while True:
+            await asyncio.sleep(0.3)
+            # Cancel any tracked snipe orders that are still open after 300ms
+            to_cancel = [oid for oid in list(self._snipe_order_ids)
+                         if oid in self.open_orders]
+            for oid in to_cancel:
+                await self.cancel_order(oid)
+            self._snipe_order_ids.clear()
 
     async def start(self):
         asyncio.create_task(self.trade_loop())
+        asyncio.create_task(self.b_mm_loop())
         asyncio.create_task(self.arb_cleanup_loop())
         await self.connect()
 

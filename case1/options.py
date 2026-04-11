@@ -55,8 +55,8 @@ def parity_gap(
     put_mid: float,
     stock_mid: float,
     strike: int,
-    r: float = 0.05,      # risk-free rate — tune this
-    T: float = 1/52,      # ~1 week to expiry as fraction of year — tune this
+    r: float = 0.0,       # risk-free rate — set to 0 (no discounting; matches detect_parity_signal_tradeable / detect_box_signal)
+    T: float = 0.0,       # time to expiry — set to 0 (no discounting)
 ) -> float:
     """
     C - P = S - K*e^(-rT)
@@ -123,67 +123,250 @@ def detect_box_signal(k1, k2, threshold, qty,
     return None
 
 
-def compute_fair_b(quotes: dict, strikes: list) -> Optional[float]:
-    """Fair B = median(call_k - put_k + K) across all 3 strikes."""
+def _one_sided_mid(bid: Optional[int], ask: Optional[int]) -> Optional[float]:
+    """Best available mid: two-sided preferred, one-sided fallback."""
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2.0
+    if bid is not None:
+        return float(bid)
+    if ask is not None:
+        return float(ask)
+    return None
+
+
+def compute_fair_b(quotes: dict, strikes: list) -> tuple[Optional[float], bool]:
+    """
+    Fair B = median(call_k - put_k + K) across strikes.
+    Returns (fair_b, is_fresh) where is_fresh=False means we fell back to one-sided quotes.
+    Accepts partial books: uses best available mid per leg.
+    """
     estimates = []
+    all_two_sided = True
     for k in strikes:
         c_bid, c_ask = quotes.get(f"B_C_{k}", (None, None))
         p_bid, p_ask = quotes.get(f"B_P_{k}", (None, None))
-        
-        if None in (c_bid, c_ask, p_bid, p_ask):
-            continue
-            
-        c_mid = (c_bid + c_ask) / 2
-        p_mid = (p_bid + p_ask) / 2
-        estimates.append(c_mid - p_mid + k)
-        
-    if len(estimates) < 1:
-        return None
-    return statistics.median(estimates)
 
-def find_stale_orders(quotes: dict, fair_b: float, strikes: list, edge: float, qty: int) -> list:
+        c_mid = _one_sided_mid(c_bid, c_ask)
+        p_mid = _one_sided_mid(p_bid, p_ask)
+
+        if c_mid is None or p_mid is None:
+            continue
+
+        if None in (c_bid, c_ask, p_bid, p_ask):
+            all_two_sided = False
+
+        estimates.append(c_mid - p_mid + k)
+
+    if not estimates:
+        return None, False
+    return statistics.median(estimates), all_two_sided
+
+def find_stale_orders(quotes: dict, fair_b: float, strikes: list, edge: float, qty: int,
+                      T: Optional[float] = None, sigma: Optional[float] = None) -> list[tuple]:
     """
-    Strategy 1: For each of the instruments, compute theoretical fair
-    using PCP + fair_b. Return (sym, qty, side, price) for anything stale.
+    Single-leg stale sniping.
+    If T and sigma are provided (BS mode): compare market price to BS fair value.
+    Otherwise (PCP fallback): use the other leg's ask as a conservative anchor.
+    Delta exposure from fills is managed separately by the delta layer in bot.py.
+    """
+    orders = []
+    use_bs = (T is not None and sigma is not None and T > 1e-6 and sigma > 1e-6)
+
+    for k in strikes:
+        c_sym = f"B_C_{k}"
+        p_sym = f"B_P_{k}"
+
+        c_bid, c_ask = quotes.get(c_sym, (None, None))
+        p_bid, p_ask = quotes.get(p_sym, (None, None))
+
+        if use_bs:
+            fair_call = bs_call_price(fair_b, k, T, sigma)
+            fair_put  = bs_put_price(fair_b, k, T, sigma)
+
+            if c_bid is not None and c_bid > fair_call + edge:
+                orders.append((c_sym, qty, Side.SELL, c_bid))
+            if c_ask is not None and c_ask < fair_call - edge:
+                orders.append((c_sym, qty, Side.BUY, c_ask))
+            if p_bid is not None and p_bid > fair_put + edge:
+                orders.append((p_sym, qty, Side.SELL, p_bid))
+            if p_ask is not None and p_ask < fair_put - edge:
+                orders.append((p_sym, qty, Side.BUY, p_ask))
+        else:
+            # PCP fallback: conservative anchor uses other leg's ask/bid
+            if c_bid is not None and p_ask is not None:
+                if c_bid > fair_b - k + p_ask + edge:
+                    orders.append((c_sym, qty, Side.SELL, c_bid))
+            if c_ask is not None and p_bid is not None:
+                if c_ask < fair_b - k + p_bid - edge:
+                    orders.append((c_sym, qty, Side.BUY, c_ask))
+            if p_bid is not None and c_ask is not None:
+                if p_bid > k - fair_b + c_ask + edge:
+                    orders.append((p_sym, qty, Side.SELL, p_bid))
+            if p_ask is not None and c_bid is not None:
+                if p_ask < k - fair_b + c_bid - edge:
+                    orders.append((p_sym, qty, Side.BUY, p_ask))
+
+    return orders
+
+
+# ── Black-Scholes engine ──────────────────────────────────────────────────────
+
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF via math.erfc — no scipy needed."""
+    return 0.5 * math.erfc(-x / math.sqrt(2))
+
+
+def bs_call_price(S: float, K: float, T: float, sigma: float) -> float:
+    """BS call price with r=0. Falls back to intrinsic at expiry or zero vol."""
+    if T <= 1e-9 or sigma <= 1e-9:
+        return max(S - K, 0.0)
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(S / K) + 0.5 * sigma ** 2 * T) / (sigma * sqrt_T)
+    d2 = d1 - sigma * sqrt_T
+    return S * _norm_cdf(d1) - K * _norm_cdf(d2)
+
+
+def bs_put_price(S: float, K: float, T: float, sigma: float) -> float:
+    """BS put price with r=0. Falls back to intrinsic at expiry or zero vol."""
+    if T <= 1e-9 or sigma <= 1e-9:
+        return max(K - S, 0.0)
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(S / K) + 0.5 * sigma ** 2 * T) / (sigma * sqrt_T)
+    d2 = d1 - sigma * sqrt_T
+    return K * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+
+def bs_call_delta(S: float, K: float, T: float, sigma: float) -> float:
+    """BS call delta = N(d1). Returns 1 or 0 at expiry."""
+    if T <= 1e-9 or sigma <= 1e-9:
+        return 1.0 if S > K else (0.5 if S == K else 0.0)
+    d1 = (math.log(S / K) + 0.5 * sigma ** 2 * T) / (sigma * math.sqrt(T))
+    return _norm_cdf(d1)
+
+
+def bs_put_delta(S: float, K: float, T: float, sigma: float) -> float:
+    """BS put delta = N(d1) - 1."""
+    return bs_call_delta(S, K, T, sigma) - 1.0
+
+
+def _bs_vega(S: float, K: float, T: float, sigma: float) -> float:
+    """BS vega: dPrice/dSigma. Same for calls and puts."""
+    if T <= 1e-9 or sigma <= 1e-9:
+        return 0.0
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(S / K) + 0.5 * sigma ** 2 * T) / (sigma * sqrt_T)
+    return S * sqrt_T * math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi)
+
+
+def implied_vol(option_price: float, S: float, K: float, T: float, is_call: bool,
+                tol: float = 0.5, max_iter: int = 8) -> Optional[float]:
+    """Newton-Raphson IV solver — converges in ~5 iterations for integer-precision prices."""
+    if T <= 1e-9 or S <= 0 or K <= 0:
+        return None
+
+    intrinsic = max(S - K, 0.0) if is_call else max(K - S, 0.0)
+    if option_price <= intrinsic + 1e-6:
+        return None
+
+    pricer = bs_call_price if is_call else bs_put_price
+    sigma = 0.3  # initial guess
+
+    for _ in range(max_iter):
+        price = pricer(S, K, T, sigma)
+        vega = _bs_vega(S, K, T, sigma)
+        if vega < 1e-10:
+            break
+        sigma -= (price - option_price) / vega
+        if sigma <= 0:
+            sigma = 0.01
+        if abs(price - option_price) < tol:
+            break
+
+    if sigma <= 0 or sigma > 20:
+        return None
+    return sigma
+
+
+def compute_implied_vols(quotes: dict, fair_b: float, T: float,
+                         strikes: list) -> tuple[dict, Optional[float]]:
+    """
+    Back-solve implied vol from each option's mid. Returns (per_symbol_dict, median_iv).
+    Uses mids so the estimate is centred and not skewed by one-sided stale quotes.
+    """
+    ivs: dict[str, float] = {}
+    for k in strikes:
+        c_sym = f"B_C_{k}"
+        p_sym = f"B_P_{k}"
+        c_bid, c_ask = quotes.get(c_sym, (None, None))
+        p_bid, p_ask = quotes.get(p_sym, (None, None))
+
+        if c_bid is not None and c_ask is not None and c_bid < c_ask:
+            iv = implied_vol((c_bid + c_ask) / 2.0, fair_b, k, T, is_call=True)
+            if iv is not None:
+                ivs[c_sym] = iv
+
+        if p_bid is not None and p_ask is not None and p_bid < p_ask:
+            iv = implied_vol((p_bid + p_ask) / 2.0, fair_b, k, T, is_call=False)
+            if iv is not None:
+                ivs[p_sym] = iv
+
+    if not ivs:
+        return ivs, None
+    return ivs, statistics.median(ivs.values())
+
+
+def option_delta(symbol: str, fair_b: float) -> float:
+    """
+    Fallback delta: linear moneyness approximation normalised to 50-pt strike spacing.
+    Used when T or sigma are unavailable. Call delta in [0.05, 0.95].
+    """
+    if "B_C_" in symbol:
+        k = int(symbol.split("_")[-1])
+        return max(0.05, min(0.95, 0.5 + 0.35 * (fair_b - k) / 50.0))
+    elif "B_P_" in symbol:
+        k = int(symbol.split("_")[-1])
+        call_d = max(0.05, min(0.95, 0.5 + 0.35 * (fair_b - k) / 50.0))
+        return call_d - 1.0
+    return 0.0
+
+
+def option_delta_bs(symbol: str, fair_b: float, T: float, sigma: float) -> float:
+    """Proper BS delta. Falls back to linear approximation when T or sigma invalid."""
+    if T <= 1e-9 or sigma <= 1e-9:
+        return option_delta(symbol, fair_b)
+    if "B_C_" in symbol:
+        k = int(symbol.split("_")[-1])
+        return bs_call_delta(fair_b, k, T, sigma)
+    elif "B_P_" in symbol:
+        k = int(symbol.split("_")[-1])
+        return bs_put_delta(fair_b, k, T, sigma)
+    return 0.0
+
+
+def find_near_expiry_orders(quotes: dict, fair_b: float, T: float,
+                             strikes: list, qty: int, buffer: float) -> list[tuple]:
+    """
+    Near-expiry theta harvesting. Only active when T < threshold (caller's responsibility).
+    Sells OTM options (intrinsic = 0) that still carry time premium above buffer.
+    ITM options are skipped — delta risk too high without per-tick hedging.
+    Delta from any fills is handled by the delta manager in bot.py.
     """
     orders = []
     for k in strikes:
         c_sym = f"B_C_{k}"
         p_sym = f"B_P_{k}"
-        
-        c_bid, c_ask = quotes.get(c_sym, (None, None))
-        p_bid, p_ask = quotes.get(p_sym, (None, None))
+        c_bid, _ = quotes.get(c_sym, (None, None))
+        p_bid, _ = quotes.get(p_sym, (None, None))
 
-        # SELL call hedge requires BUY put at ask — use p_ask as cost
-        if c_bid is not None and p_ask is not None:
-            fair_call_sell = fair_b - k + p_ask
-            if c_bid > fair_call_sell + edge:
-                orders.append((c_sym, qty, Side.SELL, c_bid))
+        c_intrinsic = max(fair_b - k, 0.0)
+        p_intrinsic = max(k - fair_b, 0.0)
 
-        # BUY call hedge requires SELL put at bid — use p_bid as revenue
-        if c_ask is not None and p_bid is not None:
-            fair_call_buy = fair_b - k + p_bid
-            if c_ask < fair_call_buy - edge:
-                orders.append((c_sym, qty, Side.BUY, c_ask))
+        # Only sell strictly OTM options (intrinsic < 1 avoids float comparison issues)
+        if c_bid is not None and c_intrinsic < 1.0 and c_bid > buffer:
+            orders.append((c_sym, qty, Side.SELL, c_bid))
 
-        # SELL put hedge requires BUY call at ask — use c_ask as cost
-        if p_bid is not None and c_ask is not None:
-            fair_put_sell = k - fair_b + c_ask
-            if p_bid > fair_put_sell + edge:
-                orders.append((p_sym, qty, Side.SELL, p_bid))
-
-        # BUY put hedge requires SELL call at bid — use c_bid as revenue
-        if p_ask is not None and c_bid is not None:
-            fair_put_buy = k - fair_b + c_bid
-            if p_ask < fair_put_buy - edge:
-                orders.append((p_sym, qty, Side.BUY, p_ask))
-
-    # Also snipe the base stock B if it's lagging!
-    s_bid, s_ask = quotes.get("B", (None, None))
-    if s_bid is not None and s_bid > fair_b + edge:
-        orders.append(("B", qty, Side.SELL, s_bid))
-    if s_ask is not None and s_ask < fair_b - edge:
-        orders.append(("B", qty, Side.BUY, s_ask))
+        if p_bid is not None and p_intrinsic < 1.0 and p_bid > buffer:
+            orders.append((p_sym, qty, Side.SELL, p_bid))
 
     return orders
 
