@@ -1,5 +1,6 @@
-# Configuration for merged Stock A + Prediction Market bot
+# Configuration for merged Stock A + Stock C + Prediction Market bot
 # Stock A: Updated per case1_stock_a_update_v2.md empirical findings
+# Stock C: Cross-asset fair value from prediction market (from c-pred branch)
 # Prediction Market: Sum arb + CPI sweep + news sweep + market follow
 
 PARAMS = {
@@ -10,8 +11,12 @@ PARAMS = {
         "skew_mult": 0.15
         # NOTE: "pe" removed — using linear regression model instead
     },
-    # C params commented out for A-only testing
-    # "C": {"spread": 1, "sweep_edge": 1, "order_size": 5, "skew_mult": 0.01}
+    "C": {
+        "spread": 3,
+        "sweep_edge": 1,
+        "order_size": 5,
+        "skew_mult": 0.01
+    },
 }
 
 # Position limits (from competition risk limits in CLAUDE.md)
@@ -87,6 +92,29 @@ POST_NEWS_MODE_S = 10
 # Exit threshold: close position once mid moves this far in our direction
 # Compromise between original (80) and empirical avg (55)
 NEWS_EXIT_MOVE_THRESHOLD = 70
+
+
+# ============================================================================
+# STOCK C CROSS-ASSET PARAMETERS (from c-pred)
+# Uses PM probabilities → E[Δr] → yield → C fair value
+# ============================================================================
+
+# Position limits for C cross-asset strategy
+C_CROSS_MAX_POS = 20       # max |position| from cross-asset strategy
+C_CROSS_QTY = 3            # contracts per cross-asset trade
+
+# Minimum |C_market - C_fair| to trigger cross-asset trade (price units)
+# Widen if γ/β_y calibration is rough; tighten as you calibrate
+CROSS_ASSET_THRESHOLD = 10
+
+# C model calibration parameters (tune from practice data)
+# β_y: decimal yield change per basis-point of expected rate change
+# γ: PE sensitivity to yield changes (PE_t = PE0 · exp(−γ · Δy))
+C_BETA_Y = 0.0002   # start conservative; tune from practice data
+C_GAMMA = 2.0        # start conservative; tune from practice data
+
+# C trade loop cadence
+C_TRADE_INTERVAL = 2.0   # seconds between C quoting cycles
 
 
 # ============================================================================

@@ -1,10 +1,16 @@
 """
-Trading Bot — Merged Stock A + Prediction Market Strategies
+Trading Bot — Merged Stock A + Stock C + Prediction Market Strategies
 
 Stock A (from rishabh-A):
 - Linear regression fair value model (Change 1, 2)
 - 8-second sniping window after earnings (Change 3)
 - Sentiment-based trading on A-news (Change 4)
+
+Stock C (from c-pred):
+- Cross-asset fair value from prediction market probabilities
+- PM probabilities → E[Δr] → yield → C fair value via case-packet formulas
+- Calibration-based scale factor to anchor model to market prices
+- Cross-asset sweeping when C market diverges from PM-derived fair value
 
 Prediction Market (from c-strat-krishi):
 - Sum arbitrage (buy/sell all 3 when sum deviates from 1000)
@@ -23,7 +29,7 @@ import grpc
 
 from utcxchangelib import XChangeClient, Side
 import config
-from fair_value import FairValueEngine
+from fair_value import FairValueEngine, CFairValueEngine
 from risk import RiskManager
 from news_sentiment import NewsSentimentClassifier
 
@@ -146,6 +152,12 @@ class MyXchangeClient(XChangeClient):
         self.last_a_news_sentiment: Optional[str] = None
         self.current_eps_a: Optional[float] = None
         self.pnl = 0
+
+        # ── Stock C state (NEW from c-pred) ─────────────────────────────────────
+        self.c_fair_value = CFairValueEngine(
+            beta_y=config.C_BETA_Y, gamma=config.C_GAMMA
+        )
+        self.current_eps_c: Optional[float] = None
 
         # ── Prediction Market state (NEW from c-strat-krishi) ─────────────────
         self.pm_current_tick = 0
@@ -682,6 +694,90 @@ class MyXchangeClient(XChangeClient):
         return self.positions.get(sym, 0)
 
     # ========================================================================
+    # STOCK C — HELPERS (NEW from c-pred)
+    # ========================================================================
+
+    def _get_current_mid_c(self) -> Optional[float]:
+        """Get current mid price for C from order book."""
+        book = self.order_books.get("C")
+        if not book:
+            return None
+        bids = [px for px, qty in book.bids.items() if qty > 0]
+        asks = [px for px, qty in book.asks.items() if qty > 0]
+        if bids and asks:
+            return (max(bids) + min(asks)) / 2
+        return None
+
+    def _get_e_delta_r(self) -> Optional[float]:
+        """
+        Compute E[Δr] (expected rate change in bps) from PM book mids.
+
+        E[Δr] = 25 × q_hike − 25 × q_cut
+        where q_hike = R_HIKE_mid / total, q_cut = R_CUT_mid / total
+        """
+        cut_mid = self._pm_mid("R_CUT")
+        hold_mid = self._pm_mid("R_HOLD")
+        hike_mid = self._pm_mid("R_HIKE")
+        if cut_mid is None or hold_mid is None or hike_mid is None:
+            return None
+        total = cut_mid + hold_mid + hike_mid
+        if total <= 0:
+            return None
+        q_hike = hike_mid / total
+        q_cut = cut_mid / total
+        return 25.0 * q_hike - 25.0 * q_cut
+
+    async def _c_cross_asset_trade(self, signal: float):
+        """
+        Execute cross-asset trade when C market diverges from PM-derived fair value.
+
+        signal > 0: C expensive vs model → sell C
+        signal < 0: C cheap vs model → buy C
+        """
+        if self.c_fair_value.fair_c is None:
+            return
+        pos = self.positions.get("C", 0)
+        if abs(pos) >= config.C_CROSS_MAX_POS:
+            return
+        max_qty = min(config.C_CROSS_QTY, config.C_CROSS_MAX_POS - abs(pos))
+        if max_qty <= 0:
+            return
+        print(f"[C CROSS] signal={signal:.1f} | fair={self.c_fair_value.fair_c:.0f} | pos={pos}")
+        await self.sweep_book("C", self.c_fair_value.fair_c,
+                              config.PARAMS["C"]["sweep_edge"], max_qty)
+
+    # ========================================================================
+    # STOCK C — EARNINGS HANDLER (NEW from c-pred)
+    # ========================================================================
+
+    async def handle_c_earnings(self, eps: float, tick: int):
+        """
+        Handle C earnings event. Calibrate/recalibrate C fair value model.
+
+        On each C earnings:
+        1. Record new EPS
+        2. Get current C market mid and E[Δr] from PM
+        3. Calibrate model with (market_mid, eps, E[Δr])
+        4. Sweep if cross-asset signal exists
+        """
+        print(f"\n[EARNINGS] C: EPS={eps:.4f}, tick={tick}")
+        self.current_eps_c = eps
+
+        # Cancel all C orders before recalibrating
+        await self.cancel_all_orders("C")
+
+        # Get current market mid and PM-derived E[Δr]
+        c_mid = self._get_current_mid_c()
+        e_dr = self._get_e_delta_r()
+
+        if c_mid is not None and e_dr is not None:
+            self.c_fair_value.calibrate(c_mid, eps, e_dr)
+            print(f"[EARNINGS] C fair value calibrated: {self.c_fair_value.fair_c:.1f}")
+        else:
+            print(f"[EARNINGS] C: Waiting for PM data to calibrate "
+                  f"(c_mid={'ok' if c_mid else 'missing'}, e_dr={'ok' if e_dr else 'missing'})")
+
+    # ========================================================================
     # PREDICTION MARKET — ORDER HELPERS (NEW from c-strat-krishi)
     # ========================================================================
 
@@ -943,9 +1039,10 @@ class MyXchangeClient(XChangeClient):
 
     async def bot_handle_book_update(self, symbol: str):
         """
-        Merged book update handler for BOTH strategies.
+        Merged book update handler for ALL THREE strategies.
 
         Stock A: mid tracking, sniping, news exit check
+        Stock C: (handled by c_trade_loop periodically)
         Prediction Market: follow window, sum arb check
         """
         # ── Stock A logic (PRESERVED) ─────────────────────────────────────────
@@ -1025,14 +1122,15 @@ class MyXchangeClient(XChangeClient):
 
     async def bot_handle_news(self, news_release: dict):
         """
-        Merged news handler for BOTH strategies.
+        Merged news handler for ALL THREE strategies.
 
         Routing:
         - A earnings → Stock A handler (PRESERVED)
-        - CPI print → PM CPI sweep (NEW)
+        - C earnings → Stock C handler (NEW from c-pred)
+        - CPI print → PM CPI sweep (PRESERVED) + C fair value update (NEW)
         - A-symbol unstructured → Stock A sentiment classifier (PRESERVED)
-        - Non-A unstructured → PM headline classifier (NEW)
-        - All news → PM follow window (NEW)
+        - Non-A unstructured → PM headline classifier (PRESERVED)
+        - All news → PM follow window (PRESERVED)
         """
         news_type = news_release["kind"]
         news_data = news_release["new_data"]
@@ -1053,6 +1151,10 @@ class MyXchangeClient(XChangeClient):
                 if asset == "A":
                     await self.handle_a_earnings(eps, tick)
 
+                # ── Stock C earnings (NEW from c-pred) ───────────────────────
+                elif asset == "C":
+                    await self.handle_c_earnings(eps, tick)
+
             elif subtype == "cpi_print":
                 # ── PM CPI sweep (NEW) ────────────────────────────────────────
                 forecast = float(news_data.get("forecast", 0))
@@ -1063,6 +1165,20 @@ class MyXchangeClient(XChangeClient):
                 if abs(surprise) >= config.PM_CPI_MIN_SURPRISE:
                     await self._pm_cpi_sweep(surprise)
                     await self._pm_check_sum_arb()
+
+                # ── CPI also affects C fair value (NEW from c-pred) ──────────
+                # CPI surprise shifts PM probabilities → E[Δr] changes → C fair value changes
+                if self.c_fair_value.calibrated:
+                    e_dr = self._get_e_delta_r()
+                    if e_dr is not None:
+                        fair_c = self.c_fair_value.compute(e_dr)
+                        if fair_c is not None:
+                            c_mid = self._get_current_mid_c()
+                            if c_mid is not None:
+                                signal = self.c_fair_value.cross_asset_signal(c_mid)
+                                print(f"[C CPI] fair={fair_c:.0f} | mid={c_mid:.0f} | signal={signal:.1f}")
+                                if abs(signal) >= config.CROSS_ASSET_THRESHOLD:
+                                    await self._c_cross_asset_trade(signal)
 
         else:
             # Unstructured news
@@ -1205,6 +1321,56 @@ class MyXchangeClient(XChangeClient):
             except Exception as e:
                 _PM_LOG.error(f"[LOOP ERR] {e}", exc_info=True)
 
+    async def c_trade_loop(self):
+        """
+        Stock C periodic trading loop (NEW from c-pred).
+
+        Computes C fair value from PM probabilities and trades when
+        the cross-asset signal exceeds the threshold.
+        """
+        await asyncio.sleep(3)  # wait for books to populate
+        print("[C] Trade loop started")
+
+        while True:
+            await asyncio.sleep(config.C_TRADE_INTERVAL)
+            try:
+                # Compute E[Δr] from PM book mids
+                e_dr = self._get_e_delta_r()
+                if e_dr is None:
+                    continue
+
+                # If we have EPS but haven't calibrated yet, try now
+                if not self.c_fair_value.calibrated and self.current_eps_c is not None:
+                    c_mid = self._get_current_mid_c()
+                    if c_mid is not None:
+                        self.c_fair_value.calibrate(c_mid, self.current_eps_c, e_dr)
+
+                if not self.c_fair_value.calibrated:
+                    continue
+
+                # Compute fair value from current PM probabilities
+                fair_c = self.c_fair_value.compute(e_dr)
+                if fair_c is None:
+                    continue
+
+                # Cross-asset sweep if signal exceeds threshold
+                c_mid = self._get_current_mid_c()
+                if c_mid is not None:
+                    signal = self.c_fair_value.cross_asset_signal(c_mid)
+                    if abs(signal) >= config.CROSS_ASSET_THRESHOLD:
+                        await self._c_cross_asset_trade(signal)
+
+                # Quote around fair value
+                await self.cancel_all_orders("C")
+                await self.quote_around("C", fair_c)
+
+                # PNL logging
+                pos_c = self.positions.get("C", 0)
+                print(f"[C] fair={fair_c:.0f} | pos={pos_c} | E[Δr]={e_dr:.2f}bps")
+
+            except Exception as e:
+                print(f"[C LOOP ERR] {e}")
+
     # ========================================================================
     # CONNECTION & STARTUP
     # ========================================================================
@@ -1222,10 +1388,11 @@ class MyXchangeClient(XChangeClient):
         await super().process_message(msg)
 
     async def start(self):
-        """Start bot with BOTH trade loops and automatic reconnection."""
-        # Launch both trade loops as independent tasks
+        """Start bot with ALL THREE trade loops and automatic reconnection."""
+        # Launch all trade loops as independent tasks
         asyncio.create_task(self.trade_loop())
         asyncio.create_task(self.pm_trade_loop())
+        asyncio.create_task(self.c_trade_loop())
 
         # Reconnection loop with exponential backoff
         backoff_s = 1.0
@@ -1236,8 +1403,10 @@ class MyXchangeClient(XChangeClient):
             try:
                 # Reset model on reconnection (indicates new round)
                 if not first_connection:
-                    _LOGGER.info("Reconnecting - resetting earnings model for new round")
+                    _LOGGER.info("Reconnecting - resetting models for new round")
                     self.fair_value.reset_model_a()
+                    self.c_fair_value.reset()
+                    self.current_eps_c = None
 
                 await self.connect()
                 first_connection = False
@@ -1276,7 +1445,7 @@ async def main():
         datefmt="%H:%M:%S",
     )
     my_client = MyXchangeClient(
-        "practice.uchicago.exchange:3333",
+        "uchicago.exchange:3333",
         "maryland_uiuc",
         "torch-karma-beacon"
     )

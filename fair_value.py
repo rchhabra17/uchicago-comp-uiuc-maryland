@@ -2,9 +2,10 @@
 Fair Value Engine for Stock A and C
 
 Stock A: Linear regression model (settled_mid = a + b × EPS)
-Stock C: Fed-linked model (COMMENTED OUT for A-only testing)
+Stock C: Cross-asset model (PM probabilities → E[Δr] → yield → C fair value)
 
-Based on empirical findings from case1_stock_a_update_v2.md.
+Stock A based on empirical findings from case1_stock_a_update_v2.md.
+Stock C based on case packet formulas with calibration (from c-pred branch).
 """
 
 import math
@@ -13,60 +14,20 @@ from typing import Optional, List, Tuple
 
 
 # ============================================================================
-# STOCK C CODE - COMMENTED OUT FOR A-ONLY TESTING
+# STOCK C — KNOWN CONSTANTS (from case packet)
 # ============================================================================
 
-# # C parameters — revealed by organizers
-# C_Y0        = 0.045   # baseline yield
-# C_PE0       = 14.0    # baseline P/E
-# C_EPS0      = 2.00    # baseline EPS (for sanity checks / fallback)
-# C_D         = 7.5     # duration
-# C_CCONV     = 55.0    # convexity
-# C_B0_OVER_N = 40.0    # bond portfolio value per share (B0 / N)
-# C_LAMBDA    = 0.65    # bond component weighting
-#
-# # C parameters — NOT revealed, must assume & tune
-# C_GAMMA     = 15.0    # PE sensitivity to yield changes (tune live; 0.5 was way too low)
-# C_BETA_Y    = 0.0001  # yield sensitivity to E[Δr] in bps (25bp E[Δr] → 25bp yield move)
-#
-#
-# class FedModel:
-#     def __init__(self):
-#         self.q_hike: float = 1/3
-#         self.q_hold: float = 1/3
-#         self.q_cut:  float = 1/3
-#
-#     def update_from_book_mids(self, hike_mid: float, hold_mid: float, cut_mid: float):
-#         total = hike_mid + hold_mid + cut_mid
-#         if total <= 0:
-#             return
-#         self.q_hike = hike_mid / total
-#         self.q_hold = hold_mid / total
-#         self.q_cut  = cut_mid  / total
-#         print(f"[FED] hike={self.q_hike:.2%}  hold={self.q_hold:.2%}  cut={self.q_cut:.2%}")
-#
-#     def update_from_cpi(self, forecast: float, actual: float):
-#         surprise = actual - forecast
-#         shift = 0.02 * surprise
-#         self.q_hike = max(0.0, self.q_hike + shift)
-#         self.q_cut  = max(0.0, self.q_cut  - shift)
-#         self._normalise()
-#         print(f"[FED CPI] surprise={surprise:+.3f}  hike={self.q_hike:.2%}  hold={self.q_hold:.2%}  cut={self.q_cut:.2%}")
-#
-#     def _normalise(self):
-#         total = self.q_hike + self.q_hold + self.q_cut
-#         if total > 0:
-#             self.q_hike /= total
-#             self.q_hold /= total
-#             self.q_cut  /= total
-#
-#     @property
-#     def expected_delta_r(self) -> float:
-#         return 25 * self.q_hike + 0 * self.q_hold + (-25) * self.q_cut
-#
-#     @property
-#     def implied_yield(self) -> float:
-#         return C_Y0 + C_BETA_Y * self.expected_delta_r
+C_Y0        = 0.045   # baseline yield
+C_PE0       = 14.0    # baseline P/E
+C_EPS0      = 2.00    # baseline EPS
+C_B0_OVER_N = 40.0    # bond portfolio value per share (B0 / N)
+C_D         = 7.5     # duration
+C_CCONV     = 55.0    # convexity
+C_LAMBDA    = 0.65    # bond component weighting
+
+# C parameters — calibrate from practice data
+C_BETA_Y_DEFAULT = 0.0002  # yield sensitivity to E[Δr] (decimal per bps)
+C_GAMMA_DEFAULT  = 2.0     # PE sensitivity to yield changes
 
 
 class FairValueEngine:
@@ -85,11 +46,6 @@ class FairValueEngine:
         self.samples_a: List[Tuple[float, float]] = []  # (eps, settled_mid) pairs
         self.fit_a: Optional[float] = None  # intercept
         self.fit_b: Optional[float] = None  # slope
-
-        # # C: Fed-linked model (COMMENTED OUT)
-        # self.fed = FedModel()
-        # self.eps_c = None
-        # self.fair_c = None
 
     def reset_model_a(self) -> None:
         """
@@ -224,64 +180,104 @@ class FairValueEngine:
         unique_eps = set(s[0] for s in self.samples_a)
         return len(unique_eps)
 
-    # ========================================================================
-    # STOCK C — COMMENTED OUT
-    # ========================================================================
 
-    # def update_c(self, eps: float) -> Optional[float]:
-    #     self.eps_c = eps
-    #     return self._compute_c()
-    #
-    # def recompute_c(self) -> Optional[float]:
-    #     """Call when Fed probabilities change but EPS hasn't."""
-    #     return self._compute_c()
-    #
-    # def _compute_c(self) -> Optional[float]:
-    #     if self.eps_c is None:
-    #         return None
-    #     y_t     = self.fed.implied_yield
-    #     delta_y = y_t - C_Y0
-    #     pe_t    = C_PE0 * math.exp(-C_GAMMA * delta_y)
-    #     p_ops   = self.eps_c * pe_t
-    #     # bond P&L per share (B0_OVER_N already folds in the 1/N)
-    #     delta_b_per_share = C_B0_OVER_N * (-C_D * delta_y + 0.5 * C_CCONV * delta_y ** 2)
-    #     self.fair_c = p_ops + C_LAMBDA * delta_b_per_share
-    #     print(f"[C FV] fair={self.fair_c:.2f}  eps={self.eps_c:.4f}  PE={pe_t:.2f}  Δy={delta_y:+.5f}")
-    #     return self.fair_c
-    #
-    # def infer_eps_c(self, market_mid: float):
-    #     """Back out implied EPS from market mid before the first C earnings release."""
-    #     if self.eps_c is None:
-    #         y_t     = self.fed.implied_yield
-    #         delta_y = y_t - C_Y0
-    #         pe_t    = C_PE0 * math.exp(-C_GAMMA * delta_y)
-    #         delta_b_per_share = C_B0_OVER_N * (-C_D * delta_y + 0.5 * C_CCONV * delta_y ** 2)
-    #
-    #         p_ops = market_mid - (C_LAMBDA * delta_b_per_share)
-    #         self.eps_c = p_ops / pe_t
-    #         print(f"[CALIBRATE] Implied EPS_C = {self.eps_c:.4f} from mid={market_mid}")
-    #         self._compute_c()
+# ============================================================================
+# STOCK C — CROSS-ASSET FAIR VALUE ENGINE (from c-pred)
+# ============================================================================
 
-    # ========================================================================
-    # ACCESSOR
-    # ========================================================================
+class CFairValueEngine:
+    """
+    Fair value computation for Stock C using cross-asset PM model.
 
-    def get(self, symbol: str) -> Optional[float]:
+    Uses prediction market probabilities → E[Δr] → yield → C fair value
+    via the case-packet formulas. Calibrates with a scale factor to anchor
+    model output to observed market prices.
+
+    Usage:
+        1. Call calibrate(market_mid, eps, e_delta_r) after first C earnings
+        2. Call compute(e_delta_r) whenever PM probabilities change
+        3. Use cross_asset_signal(c_market_mid) to find mispricings
+    """
+
+    def __init__(self, beta_y: float = C_BETA_Y_DEFAULT, gamma: float = C_GAMMA_DEFAULT):
+        self.beta_y = beta_y
+        self.gamma = gamma
+        self.eps_c: Optional[float] = None
+        self.calibrated = False
+        self.c_baseline_price: Optional[float] = None
+        self.c_baseline_e_dr: Optional[float] = None
+        self.c_baseline_raw: Optional[float] = None
+        self.c_price_scale: float = 1.0
+        self.fair_c: Optional[float] = None
+
+    def _raw(self, eps: float, e_delta_r: float) -> float:
         """
-        Get fair value for a symbol.
+        Unscaled fair value for C from case-packet formulas.
 
-        Args:
-            symbol: "A" or "C"
-
-        Returns:
-            Fair value if available, else None
+        Δy    = β_y · E[Δr]
+        PE_t  = PE₀ · exp(−γ · Δy)
+        ΔB/N  = (B₀/N) · (−D·Δy + ½·Conv·Δy²)
+        P_raw = EPS · PE_t + λ · ΔB/N
         """
-        if symbol == "A":
-            # Return current fair value if we have the most recent EPS
-            # For now, return None (caller must use fair_value_a(eps) directly)
-            return None  # A's fair value is EPS-dependent, no static value
+        delta_y = self.beta_y * e_delta_r
+        pe_t = C_PE0 * math.exp(-self.gamma * delta_y)
+        delta_b_n = C_B0_OVER_N * (-C_D * delta_y + 0.5 * C_CCONV * delta_y ** 2)
+        return eps * pe_t + C_LAMBDA * delta_b_n
 
-        # if symbol == "C":
-        #     return self.fair_c
+    def calibrate(self, market_mid: float, eps: float, e_delta_r: float):
+        """
+        Anchor the scale factor to the current market price.
 
-        return None
+        Call after each C earnings release with the current market mid
+        and E[Δr] from the prediction market.
+        """
+        self.eps_c = eps
+        self.c_baseline_e_dr = e_delta_r
+        self.c_baseline_raw = self._raw(eps, e_delta_r)
+        if self.c_baseline_raw > 0:
+            self.c_price_scale = market_mid / self.c_baseline_raw
+        else:
+            self.c_price_scale = 1.0
+        self.c_baseline_price = market_mid
+        self.calibrated = True
+        self.fair_c = market_mid
+        print(f"[C CALIBRATE] market={market_mid:.1f} | scale={self.c_price_scale:.1f} "
+              f"| E[Δr]={e_delta_r:.2f}bps | eps={eps:.4f}")
+
+    def compute(self, e_delta_r: float, eps: Optional[float] = None) -> Optional[float]:
+        """
+        Compute C fair value from current E[Δr].
+
+        Returns fair_c in market price units, or None if not calibrated.
+        """
+        if not self.calibrated:
+            return None
+        if eps is not None:
+            self.eps_c = eps
+        if self.eps_c is None:
+            return None
+        raw = self._raw(self.eps_c, e_delta_r)
+        self.fair_c = raw * self.c_price_scale
+        return self.fair_c
+
+    def cross_asset_signal(self, c_market_mid: float) -> float:
+        """
+        Returns mispricing: positive = C expensive vs model, negative = C cheap.
+
+        signal > threshold  → sell C
+        signal < -threshold → buy C
+        """
+        if self.fair_c is None:
+            return 0.0
+        return c_market_mid - self.fair_c
+
+    def reset(self):
+        """Reset C model for new round."""
+        self.eps_c = None
+        self.calibrated = False
+        self.c_baseline_price = None
+        self.c_baseline_e_dr = None
+        self.c_baseline_raw = None
+        self.c_price_scale = 1.0
+        self.fair_c = None
+        print("[CALIBRATE] ✓ Model C reset for new round")
