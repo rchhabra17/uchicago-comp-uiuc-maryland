@@ -1,152 +1,186 @@
-# In fair_value.py
+# fair_value.py — Strategy 4: Cross-asset C fair value from prediction market
+"""
+Given a FedProbabilityModel (from prediction_market.py), compute the fair value
+of Stock C using the case-packet formulas with known constants.
+
+Known parameters (from case packet):
+  y₀     = 0.045   baseline yield (4.5%)
+  PE₀    = 14.0    baseline P/E
+  EPS₀   = 2.00    baseline EPS (overwritten by earnings news)
+  B₀/N   = 40.0    bond portfolio per share
+  D      = 7.5     duration
+  Conv   = 55.0    convexity
+  λ      = 0.65    bond-component weighting
+
+Unknown (calibrate during practice):
+  γ      — PE sensitivity to yield: PE_t = PE₀·exp(−γ·Δy)
+  β_y    — yield sensitivity to rate expectations: Δy = β_y · E[Δr]
+
+The model output is a *relative* fair value: anchored to the first observed
+market price, then tracking changes driven by the prediction market.
+"""
 
 import math
+import logging
+from typing import Optional
 
-# Add these constants at the top — update when released on Ed
-C_GAMMA  = 0.5
-C_BETA_Y = 0.0001
-C_Y0     = 0.04
-C_PE0    = 20.0
-C_B0     = 1000.0
-C_D      = 7.0
-C_CCONV  = 50.0
-C_LAMBDA = 0.5
-C_N      = 100.0
+log = logging.getLogger("FV")
 
-class FedModel:
-    def __init__(self):
-        self.q_hike: float = 1/3
-        self.q_hold: float = 1/3
-        self.q_cut:  float = 1/3
+# ── Known constants (case packet) ─────────────────────────────────────────────
+Y0         = 0.045    # baseline yield
+PE0        = 14.0     # baseline P/E
+EPS0       = 2.00     # baseline EPS
+B0_N       = 40.0     # bond portfolio per share  (B₀/N)
+D          = 7.5      # duration
+CONV       = 55.0     # convexity
+LAMBDA     = 0.65     # bond-component weighting
 
-    def update_from_book_mids(self, hike_mid: float, hold_mid: float, cut_mid: float):
-        total = hike_mid + hold_mid + cut_mid
-        if total <= 0:
-            return
-        self.q_hike = hike_mid / total
-        self.q_hold = hold_mid / total
-        self.q_cut  = cut_mid  / total
-        print(f"[FED] hike={self.q_hike:.2%}  hold={self.q_hold:.2%}  cut={self.q_cut:.2%}")
+# ── Unknown parameters — calibrated from market ───────────────────────────────
+# β_y: E[Δr] is in bps; y is in decimal.  A full 25-bp expected hike should
+#   move yields by something like 3–8 bps → β_y ≈ 0.12–0.32 bp/bp → 0.000012–0.000032
+#   in decimal/bp units.  Start conservatively; tune during practice.
+BETA_Y_DEFAULT = 0.0002    # yield moves 0.02% per bp of expected rate change
+GAMMA_DEFAULT  = 2.0       # PE decays ~2% per 1% of yield change
 
-    def update_from_cpi(self, forecast: float, actual: float):
-        surprise = actual - forecast
-        shift = 0.02 * surprise
-        self.q_hike = max(0.0, self.q_hike + shift)
-        self.q_cut  = max(0.0, self.q_cut  - shift)
-        self._normalise()
-        print(f"[FED CPI] surprise={surprise:+.3f}  hike={self.q_hike:.2%}  hold={self.q_hold:.2%}  cut={self.q_cut:.2%}")
+# ── Cross-asset trade threshold ───────────────────────────────────────────────
+# Only trade C if its market price deviates from fair value by this many points.
+CROSS_ASSET_THRESHOLD = 10   # points — widen if γ / β_y calibration is rough
 
-    def _normalise(self):
-        total = self.q_hike + self.q_hold + self.q_cut
-        if total > 0:
-            self.q_hike /= total
-            self.q_hold /= total
-            self.q_cut  /= total
-
-    @property
-    def expected_delta_r(self) -> float:
-        return 25 * self.q_hike + 0 * self.q_hold + (-25) * self.q_cut
-
-    @property
-    def implied_yield(self) -> float:
-        return C_Y0 + C_BETA_Y * self.expected_delta_r
-
-
-# Then in FairValueEngine.__init__, add:
-#   self.fed   = FedModel()
-#   self.eps_c = None
-#   self.fair_c = None
-
-# Add these methods to FairValueEngine:
-def update_c(self, eps: float) -> float | None:
-    self.eps_c = eps
-    return self._compute_c()
-
-def recompute_c(self) -> float | None:
-    return self._compute_c()
-
-def _compute_c(self) -> float | None:
-    if self.eps_c is None:
-        return None
-    y_t     = self.fed.implied_yield
-    delta_y = y_t - C_Y0
-    pe_t    = C_PE0 * math.exp(-C_GAMMA * delta_y)
-    p_ops   = self.eps_c * pe_t
-    delta_b = C_B0 * (-C_D * delta_y + 0.5 * C_CCONV * delta_y ** 2)
-    self.fair_c = p_ops + C_LAMBDA * delta_b / C_N
-    print(f"[C FV] fair={self.fair_c:.2f}  eps={self.eps_c:.4f}  PE={pe_t:.2f}")
-    return self.fair_c
-
-# And in get(), add:
-#   if symbol == "C":
-#       return self.fair_c
 
 class FairValueEngine:
-    def __init__(self):
-        self.eps_a = None
-        self.fair_a = None
-        self.pe_a = None
-        self.calibrating = True
-        self.fed   = FedModel()
-        self.eps_c = None
-        self.fair_c = None
+    """
+    Computes C's fair value from the prediction market probabilities.
 
-    def update_a(self, eps: float, market_mid: float = None) -> float | None:
-        self.eps_a = eps
+    Usage:
+      1. Call calibrate(market_mid, eps) once (after first earnings + PM data).
+      2. Call compute(e_delta_r, eps) on every PM or earnings update.
+      3. Compare result against C's market mid to find cross-asset mispricings.
 
-        if self.calibrating and market_mid is not None:
-            # First earnings: don't trust our PE, learn from market
-            # We can't use mid RIGHT NOW (market hasn't reacted yet)
-            # So we flag that we need to calibrate after the market settles
+    Calibration anchors our *scale factor* so the model tracks dollar-price
+    movements even though γ and β_y aren't perfectly known.
+    """
+
+    def __init__(self, beta_y: float = BETA_Y_DEFAULT, gamma: float = GAMMA_DEFAULT):
+        self.beta_y   = beta_y
+        self.gamma    = gamma
+
+        # EPS state
+        self.eps_c: Optional[float] = None
+
+        # Calibration state
+        self.calibrated          = False
+        self.c_baseline_price    = None   # market price at calibration
+        self.c_baseline_e_dr     = None   # E[Δr] at calibration
+        self.c_baseline_raw      = None   # raw model output at calibration
+        self.c_price_scale       = 1.0    # market_price / raw_model at calibration
+
+        # Latest fair value
+        self.fair_c: Optional[float] = None
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  CORE MODEL
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _raw(self, eps: float, e_delta_r: float) -> float:
+        """
+        Unscaled fair value for C.
+
+            Δy      = β_y · E[Δr]
+            PE_t    = PE₀ · exp(−γ · Δy)
+            ΔB/N    = (B₀/N) · (−D·Δy + ½·Conv·Δy²)
+            P_raw   = EPS · PE_t + λ · ΔB/N
+
+        E[Δr] is in basis points; β_y converts to decimal yield change.
+        """
+        delta_y   = self.beta_y * e_delta_r          # decimal yield change
+        pe_t      = PE0 * math.exp(-self.gamma * delta_y)
+        delta_b_n = B0_N * (-D * delta_y + 0.5 * CONV * delta_y ** 2)
+        return eps * pe_t + LAMBDA * delta_b_n
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  CALIBRATION
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def calibrate(self, market_mid: float, eps: float, e_delta_r: float):
+        """
+        Anchor the scale factor to the current market price.
+
+        Call this:
+          - At the start of each round once both an earnings print AND a
+            two-sided PM book exist.
+          - After each C earnings release (re-anchor to latest market mid).
+        """
+        self.eps_c              = eps
+        self.c_baseline_e_dr   = e_delta_r
+        self.c_baseline_raw    = self._raw(eps, e_delta_r)
+        if self.c_baseline_raw > 0:
+            self.c_price_scale = market_mid / self.c_baseline_raw
+        else:
+            self.c_price_scale = 1.0
+        self.c_baseline_price  = market_mid
+        self.calibrated        = True
+        self.fair_c            = market_mid
+
+        log.info(
+            f"[C CALIBRATE] market={market_mid:.1f} | raw={self.c_baseline_raw:.3f} "
+            f"| scale={self.c_price_scale:.1f} | E[Δr]={e_delta_r:.2f}bps | eps={eps:.4f}"
+        )
+
+    def recalibrate(self, market_mid: float, e_delta_r: float):
+        """Re-anchor to new market mid (call on each C earnings release)."""
+        if self.eps_c is not None:
+            self.calibrate(market_mid, self.eps_c, e_delta_r)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  COMPUTE
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def compute(self, e_delta_r: float, eps: Optional[float] = None) -> Optional[float]:
+        """
+        Compute C fair value from current E[Δr].
+        Returns fair_c in market price units, or None if not calibrated.
+        """
+        if not self.calibrated:
             return None
-
-        if self.pe_a is not None:
-            self.fair_a = eps * self.pe_a
-            return self.fair_a
-        return None
-
-    def calibrate_pe(self, market_mid: float):
-        """Call this ~10s after first earnings, once market has settled."""
-        if self.eps_a is not None and market_mid is not None:
-            self.pe_a = market_mid / self.eps_a
-            self.calibrating = False
-            self.fair_a = self.eps_a * self.pe_a
-            print(f"[CALIBRATE] PE_A = {self.pe_a:.1f} (from mid={market_mid}, eps={self.eps_a})")
-
-    def get(self, symbol: str) -> float | None:
-        if symbol == "A":
-            return self.fair_a
-        if symbol == "C":
-            return self.fair_c
-        return None
-    
-    def update_c(self, eps: float) -> float | None:
-        self.eps_c = eps
-        return self._compute_c()
-
-    def recompute_c(self) -> float | None:
-        return self._compute_c()
-
-    def _compute_c(self) -> float | None:
+        if eps is not None:
+            self.eps_c = eps
         if self.eps_c is None:
             return None
-        y_t     = self.fed.implied_yield
-        delta_y = y_t - C_Y0
-        pe_t    = C_PE0 * math.exp(-C_GAMMA * delta_y)
-        p_ops   = self.eps_c * pe_t
-        delta_b = C_B0 * (-C_D * delta_y + 0.5 * C_CCONV * delta_y ** 2)
-        self.fair_c = p_ops + C_LAMBDA * delta_b / C_N
-        print(f"[C FV] fair={self.fair_c:.2f}  eps={self.eps_c:.4f}  PE={pe_t:.2f}")
+
+        raw       = self._raw(self.eps_c, e_delta_r)
+        self.fair_c = raw * self.c_price_scale
+
+        delta_raw = raw - self.c_baseline_raw
+        delta_px  = self.fair_c - self.c_baseline_price
+
+        log.debug(
+            f"[C FV] fair={self.fair_c:.1f} | E[Δr]={e_delta_r:.2f}bps "
+            f"| Δraw={delta_raw:.4f} | Δpx={delta_px:.1f} | eps={self.eps_c:.4f}"
+        )
         return self.fair_c
 
-    def infer_eps_c(self, market_mid: float):
-        if self.eps_c is None:
-            y_t     = self.fed.implied_yield
-            delta_y = y_t - C_Y0
-            pe_t    = C_PE0 * math.exp(-C_GAMMA * delta_y)
-            delta_b = C_B0 * (-C_D * delta_y + 0.5 * C_CCONV * delta_y ** 2)
-            
-            p_ops = market_mid - (C_LAMBDA * delta_b / C_N)
-            self.eps_c = p_ops / pe_t
-            print(f"[CALIBRATE] Implied EPS_C = {self.eps_c:.4f} from mid={market_mid}")
-            self._compute_c()
+    # ══════════════════════════════════════════════════════════════════════════
+    #  CROSS-ASSET SIGNAL
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def cross_asset_signal(self, c_market_mid: float) -> float:
+        """
+        Returns the mispricing: positive means C is expensive vs PM model,
+        negative means C is cheap vs PM model.
+
+        cross_asset_signal > CROSS_ASSET_THRESHOLD  →  sell C
+        cross_asset_signal < -CROSS_ASSET_THRESHOLD →  buy  C
+        """
+        if self.fair_c is None:
+            return 0.0
+        return c_market_mid - self.fair_c
+
+    def update_gamma(self, gamma: float):
+        """Hot-update γ between rounds if calibration suggests a new value."""
+        self.gamma = gamma
+        log.info(f"[FV] γ updated to {gamma}")
+
+    def update_beta_y(self, beta_y: float):
+        """Hot-update β_y between rounds."""
+        self.beta_y = beta_y
+        log.info(f"[FV] β_y updated to {beta_y}")
