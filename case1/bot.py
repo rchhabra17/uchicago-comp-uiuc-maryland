@@ -20,6 +20,7 @@ import logging
 from typing import Optional
 
 from utcxchangelib import XChangeClient, Side
+from meta_market import MetaMarketStrategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -171,6 +172,9 @@ class PMBot(XChangeClient):
 
         self.arb_pending: set[str] = set()
         self.arb_busy = False
+
+        # Meta market — tracks fill count, projects total by tick 4400
+        self.meta = MetaMarketStrategy()
 
         # Market-follow state: after news, watch for first significant move
         import time as _time
@@ -543,6 +547,9 @@ class PMBot(XChangeClient):
             self.arb_pending.discard(oid)
 
     async def bot_handle_trade_msg(self, symbol: str, price: int, qty: int):
+        # Meta market: count every fill message
+        self.meta.on_trade_msg(symbol, price, qty, self.current_tick)
+
         if symbol in PM_SYMS and not self.arb_busy:
             await self._check_sum_arb()
 
@@ -554,6 +561,7 @@ class PMBot(XChangeClient):
         news_data = news_release.get("new_data", {})
         tick      = news_release.get("tick", 0)
         self.current_tick = max(self.current_tick, tick)
+        self.meta.on_tick(tick)
 
         # Open a follow window on EVERY news event — even if we can't parse it,
         # the market will react and we can follow the first significant move
@@ -628,6 +636,9 @@ class PMBot(XChangeClient):
 
                 await self._check_sum_arb()
 
+                # Meta market — project fill count and trade if edge
+                await self.meta.check_and_trade(self)
+
                 # Status
                 if self.loop_count % 30 == 0:
                     pm_mids = {s: self._mid(s) for s in PM_SYMS}
@@ -641,6 +652,7 @@ class PMBot(XChangeClient):
                         f"news={self.pnl['news']:+d}  follow={self.pnl['follow']:+d}  "
                         f"cash={self.pnl['total']:+d}  mtm={mtm:+.0f}"
                     )
+                    log.info(f"[META] {self.meta.status_line()}")
 
             except Exception as e:
                 log.error(f"[LOOP ERR] {e}", exc_info=True)
