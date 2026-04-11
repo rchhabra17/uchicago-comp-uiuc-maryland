@@ -1,13 +1,19 @@
 """
-Trading Bot for Stock A
+Trading Bot — Merged Stock A + Prediction Market Strategies
 
-Implements empirical findings from case1_stock_a_update_v2.md:
+Stock A (from rishabh-A):
 - Linear regression fair value model (Change 1, 2)
 - 8-second sniping window after earnings (Change 3)
 - Sentiment-based trading on A-news (Change 4)
-- Stock C code COMMENTED OUT for A-only testing
+
+Prediction Market (from c-strat-krishi):
+- Sum arbitrage (buy/sell all 3 when sum deviates from 1000)
+- CPI sprint (aggressive directional sweep on CPI surprise)
+- News sweep (tiered hawk/dove headline classifier)
+- Market follow (follow first mover after any news event)
 """
 
+import re
 from typing import Optional, Deque
 from collections import deque
 import time
@@ -22,6 +28,99 @@ from risk import RiskManager
 from news_sentiment import NewsSentimentClassifier
 
 _LOGGER = logging.getLogger("xchange-client")
+_PM_LOG = logging.getLogger("PM")
+
+# ============================================================================
+# PREDICTION MARKET — News regex patterns (from c-strat-krishi bot.py)
+# ============================================================================
+
+# T1: Direct, unambiguous Fed language
+_HAWK_T1 = re.compile(
+    r"\brate\s+hike\b|\bhike\s+(?:rates?|interest)\b|"
+    r"\b(?:raises?|raised|raising)\s+(?:rates?|interest\s+rates?)\b|"
+    r"\bfomc\s+(?:hike|raise|increase)\b|"
+    r"\bhawkish\s+(?:pivot|turn|shift|stance)\b|"
+    r"\b\d+\s*(?:basis\s*points?|bps?)\s+(?:rate\s+)?hike\b|"
+    r"\bhike\b.{0,20}\brates?\b|"
+    r"\btighten(?:ing)?\s+(?:monetary|policy|stance)\b|"
+    r"\brestrictive\s+(?:policy|stance|posture)\b(?!.{0,20}(?:no longer|not\s+needed|unnecessary|unwarranted))|"
+    r"\bpremature\s+easing\b|"
+    r"\breignite\b.{0,20}\b(?:inflation|price|pressure)\b|"
+    r"\bpolicy\s+will\s+stay\s+firm\b",
+    re.IGNORECASE,
+)
+_DOVE_T1 = re.compile(
+    r"\brate\s+cut\b|\bcut\s+(?:rates?|interest)\b|"
+    r"\b(?:lowers?|lowered|lowering|reduces?)\s+(?:rates?|interest\s+rates?)\b|"
+    r"\bfomc\s+(?:cut|lower|decrease)\b|"
+    r"\bdovish\s+(?:pivot|turn|shift|stance)\b|"
+    r"\b\d+\s*(?:basis\s*points?|bps?)\s+(?:rate\s+)?cut\b|"
+    r"\bcut\b.{0,20}\brates?\b|"
+    r"\bpreemptive\s+cut\b|"
+    r"\beas(?:e|ing)\s+(?:monetary|policy|stance)\b|"
+    r"\b(?:monetary|policy)\s+eas(?:e|ing)\b|"
+    r"\baccommodat(?:ion|ive|ing)\b|"
+    r"\bloos(?:en|er|ening)\s+(?:monetary|policy)\b|"
+    r"\brate\s+relief\b|"
+    r"\brestrictive.{0,20}no\s+longer\b|"
+    r"\bno\s+longer.{0,10}restrictive\b",
+    re.IGNORECASE,
+)
+
+_ANTI_DOVE = re.compile(
+    r"\bwarn|premature\s+easing|reignite|too\s+(?:early|soon)|risk.{0,15}easing",
+    re.IGNORECASE,
+)
+
+# T2: Macro data signals
+_HAWK_T2 = re.compile(
+    r"inflation\s+(?:above|surge|spike|jump|rise|elevated|persist|high|accelerat)|"
+    r"(?:cpi|pce|ppi)\s+(?:above|beat|exceed|hot|surge)|"
+    r"above\s+(?:target|expectation|forecast)|"
+    r"(?:labor|job)\s+market\s+(?:tight|strong|hot)|"
+    r"unemployment\s+(?:fall|drop|low|decline|near.{0,10}low|hit.{0,10}low)|"
+    r"(?:strong|robust|solid)\s+(?:jobs?|payroll|nfp|employment)|"
+    r"(?:low|record.low|historic.{0,5}low)\s+unemployment|"
+    r"jobless\s+claims?\s+(?:fall|drop|decline|low|plunge)|"
+    r"hiring\s+(?:surge|boom|strong|accelerat|jump)|"
+    r"(?:jobs?|employment)\s+(?:surge|boom|soar|jump)|"
+    r"wage\s+(?:growth|pressure|rise|inflation)\b(?!.{0,15}(?:decelerat|slow|cool|eas|fall|declin))|"
+    r"overheating|price\s+pressure",
+    re.IGNORECASE,
+)
+_DOVE_T2 = re.compile(
+    r"recession|contraction|gdp\s+(?:fall|drop|decline|shrink|negative)|"
+    r"inflation\s+(?:below|cool|ease|slow|fall|drop|decline|miss)|"
+    r"(?:cpi|pce|ppi)\s+(?:below|miss|cool|ease|soft)|"
+    r"below\s+(?:target|expectation|forecast)|"
+    r"unemployment\s+(?:rise|spike|jump|high|climb|surge|soar|hit.{0,10}high)|"
+    r"(?:high|record.high|historic.{0,5}high|rising)\s+unemployment|"
+    r"jobless\s+claims?\s+(?:rise|surge|spike|jump|soar|high)|"
+    r"(?:job|payroll)\s+(?:loss|decline|weak|miss|cut)|"
+    r"layoff|slowdown|deflation|weak\s+(?:growth|demand|consumer)|"
+    r"wage.{0,15}(?:decelerat|slow|cool|eas|fall|declin)|"
+    r"disinflation",
+    re.IGNORECASE,
+)
+
+# T3: Soft/contextual signals
+_HAWK_T3 = re.compile(
+    r"resilient|robust\s+growth|consumer\s+(?:spending|confidence)\s+(?:up|strong|rise)|"
+    r"inflationary|hawkish|tighten", re.IGNORECASE,
+)
+_DOVE_T3 = re.compile(
+    r"headwind|uncertainty|cooling(?!\s+inflation)|\bdovish\b|"
+    r"easing\s+(?:inflation|pressure)|soft\s+landing|below\s+expectation|"
+    r"safeguard\s+growth|protect\s+growth|support\s+growth",
+    re.IGNORECASE,
+)
+
+_NEGATION = re.compile(
+    r"\b(?:decelerat|slow(?:ing|ed|s)?|cool(?:ing|ed|s)?|eas(?:ing|ed|es)|"
+    r"fall(?:ing|s)?|declin(?:ing|ed|es)?|drop(?:ping|ped|s)?|weak(?:en|ing|ed)?|"
+    r"fad(?:ing|ed|es)?|moder(?:at|ating|ated))\b",
+    re.IGNORECASE,
+)
 
 
 class MyXchangeClient(XChangeClient):
@@ -29,40 +128,47 @@ class MyXchangeClient(XChangeClient):
     def __init__(self, host: str, username: str, password: str):
         super().__init__(host, username, password)
 
-        # Fair value and risk
+        # ── Stock A state (PRESERVED from rishabh-A) ──────────────────────────
         self.fair_value = FairValueEngine()
         self.risk = RiskManager()
         self.sentiment = NewsSentimentClassifier()
 
-        # Mid price tracking for settled window averaging
-        # Stores (timestamp, mid) tuples, kept for last 30 seconds
-        self.recent_mids_a: Deque[tuple] = deque(maxlen=300)  # ~10 updates/sec × 30s
-
-        # Contamination tracking: recent A-related news events
-        # Stores (tick, event_type) tuples
+        self.recent_mids_a: Deque[tuple] = deque(maxlen=300)
         self.recent_a_news: list = []
 
-        # Sniping mode state
         self.sniping_mode_active = False
         self.sniping_start_time: Optional[float] = None
 
-        # News trading state
         self.post_news_mode_until: Optional[float] = None
         self.news_entry_mid: Optional[float] = None
-        self.news_direction: Optional[int] = None  # +1 for bullish, -1 for bearish
+        self.news_direction: Optional[int] = None
 
-        # Sentiment tracking for earnings prediction
-        # Tracks last A-news sentiment to inform pre-earnings position decisions
-        self.last_a_news_sentiment: Optional[str] = None  # "bullish", "bearish", or None
-
-        # Current EPS (updated on each earnings)
+        self.last_a_news_sentiment: Optional[str] = None
         self.current_eps_a: Optional[float] = None
-
-        # PnL tracking
         self.pnl = 0
 
+        # ── Prediction Market state (NEW from c-strat-krishi) ─────────────────
+        self.pm_current_tick = 0
+        self.pm_loop_count = 0
+        self.pm_arb_cooldown = 0
+        self.pm_arb_pending: set[str] = set()
+        self.pm_arb_busy = False
+
+        # Market-follow state
+        self.pm_follow_snapshot: dict[str, float] = {}
+        self.pm_follow_deadline: float = 0.0
+        self.pm_follow_fired: bool = True
+
+        # Stale order tracking for directional PM orders
+        self.pm_directional_orders: list[tuple[str, float]] = []
+        self.pm_news_traded_syms: set[str] = set()
+
+        # PM P&L tracking
+        self.pm_pnl = {"arb": 0, "cpi": 0, "news": 0, "follow": 0, "total": 0}
+        self.pm_fill_source: dict[str, str] = {}
+
     # ========================================================================
-    # ORDER MANAGEMENT
+    # STOCK A — ORDER MANAGEMENT (PRESERVED)
     # ========================================================================
 
     async def cancel_all_orders(self, symbol: str):
@@ -150,7 +256,7 @@ class MyXchangeClient(XChangeClient):
             await self.place_order(symbol, size, Side.SELL, ask_price)
 
     # ========================================================================
-    # MID PRICE TRACKING
+    # STOCK A — MID PRICE TRACKING (PRESERVED)
     # ========================================================================
 
     def _get_current_mid_a(self) -> Optional[float]:
@@ -188,7 +294,7 @@ class MyXchangeClient(XChangeClient):
         return sum(samples_in_window) / len(samples_in_window)
 
     # ========================================================================
-    # CALIBRATION (Changes 1, 2)
+    # STOCK A — CALIBRATION (Changes 1, 2) (PRESERVED)
     # ========================================================================
 
     async def handle_a_earnings(self, eps: float, tick: int):
@@ -314,7 +420,7 @@ class MyXchangeClient(XChangeClient):
         self.fair_value.add_sample_a(eps, settled_mid)
 
     # ========================================================================
-    # SNIPING MODE (Change 3)
+    # STOCK A — SNIPING MODE (Change 3) (PRESERVED)
     # ========================================================================
 
     async def enter_sniping_mode(self, duration_s: float):
@@ -384,7 +490,7 @@ class MyXchangeClient(XChangeClient):
         await self.sweep_book("A", fair, edge, config.SNIPING_MAX_PER_SCAN)
 
     # ========================================================================
-    # NEWS SENTIMENT TRADING (Change 4)
+    # STOCK A — NEWS SENTIMENT TRADING (Change 4) (PRESERVED)
     # ========================================================================
 
     async def handle_a_news_trade(self, sentiment: str, confidence: float, content: str):
@@ -521,7 +627,7 @@ class MyXchangeClient(XChangeClient):
 
         if pos > 0:
             # Sell to close long
-            bids_sorted = bids_sorted = sorted(((px, qty) for px, qty in book.bids.items() if qty > 0), reverse=True)
+            bids_sorted = sorted(((px, qty) for px, qty in book.bids.items() if qty > 0), reverse=True)
             remaining = pos
 
             for price, available_qty in bids_sorted:
@@ -551,60 +657,390 @@ class MyXchangeClient(XChangeClient):
         self.news_direction = None
 
     # ========================================================================
-    # EVENT HANDLERS
+    # PREDICTION MARKET — BOOK HELPERS (NEW from c-strat-krishi)
+    # ========================================================================
+
+    def _pm_best_bid(self, sym: str) -> Optional[int]:
+        book = self.order_books.get(sym)
+        if not book:
+            return None
+        bids = [k for k, v in book.bids.items() if v > 0]
+        return max(bids) if bids else None
+
+    def _pm_best_ask(self, sym: str) -> Optional[int]:
+        book = self.order_books.get(sym)
+        if not book:
+            return None
+        asks = [k for k, v in book.asks.items() if v > 0]
+        return min(asks) if asks else None
+
+    def _pm_mid(self, sym: str) -> Optional[float]:
+        b, a = self._pm_best_bid(sym), self._pm_best_ask(sym)
+        return (b + a) / 2 if b and a else None
+
+    def _pm_pos(self, sym: str) -> int:
+        return self.positions.get(sym, 0)
+
+    # ========================================================================
+    # PREDICTION MARKET — ORDER HELPERS (NEW from c-strat-krishi)
+    # ========================================================================
+
+    async def _pm_place(self, sym: str, qty: int, side: Side, price: int, tag: str = ""):
+        """Place a PM order with position limits and tagging."""
+        curr = self._pm_pos(sym)
+        if side == Side.BUY and curr >= config.PM_SOFT_LIMIT:
+            return None
+        if side == Side.SELL and curr <= -config.PM_SOFT_LIMIT:
+            return None
+        qty = min(qty, config.MAX_ORDER_SIZE)
+        if qty <= 0:
+            return None
+        try:
+            oid = await self.place_order(sym, qty, side, max(1, int(price)))
+            oid_str = str(oid)
+            if tag:
+                self.pm_fill_source[oid_str] = tag
+            if tag == "arb":
+                self.pm_arb_pending.add(oid_str)
+            if tag in ("cpi", "news", "follow"):
+                self.pm_directional_orders.append((oid_str, time.time() + 2.0))
+            return oid_str
+        except Exception as e:
+            _PM_LOG.warning(f"[ORDER ERR] {sym} {side.name} {qty}@{price}: {e}")
+            return None
+
+    async def _pm_cancel_stale_directional(self):
+        """Cancel directional PM orders older than 2s."""
+        now = time.time()
+        still_live = []
+        for oid, expiry in self.pm_directional_orders:
+            if now >= expiry and oid in self.open_orders:
+                try:
+                    await self.cancel_order(oid)
+                except Exception:
+                    pass
+            elif oid in self.open_orders:
+                still_live.append((oid, expiry))
+        self.pm_directional_orders = still_live
+
+    # ========================================================================
+    # PM STRATEGY 1: SUM ARBITRAGE (NEW from c-strat-krishi)
+    # ========================================================================
+
+    async def _pm_cancel_arb(self):
+        for oid in list(self.pm_arb_pending):
+            if oid in self.open_orders:
+                try:
+                    await self.cancel_order(oid)
+                except Exception:
+                    pass
+        self.pm_arb_pending.clear()
+        self.pm_arb_busy = False
+
+    async def _pm_check_sum_arb(self):
+        if self.pm_arb_cooldown > 0:
+            self.pm_arb_cooldown -= 1
+            return
+        if self.pm_arb_busy:
+            return
+
+        pos = {s: self._pm_pos(s) for s in config.PM_SYMS}
+        max_pos = max(abs(pos[s]) for s in config.PM_SYMS)
+        if max_pos >= config.PM_ARB_MAX_NET:
+            return
+
+        bids = {s: self._pm_best_bid(s) for s in config.PM_SYMS}
+        asks = {s: self._pm_best_ask(s) for s in config.PM_SYMS}
+
+        if all(asks[s] for s in config.PM_SYMS):
+            if min(asks[s] for s in config.PM_SYMS) >= config.PM_ARB_SKIP_BELOW:
+                sum_ask = sum(asks[s] for s in config.PM_SYMS)
+                profit = config.PM_RESOLUTION - sum_ask
+                if profit >= config.PM_ARB_MIN_PROFIT:
+                    qty = min(config.PM_ARB_SIZE, min(config.PM_SOFT_LIMIT - pos[s] for s in config.PM_SYMS))
+                    if qty > 0:
+                        _PM_LOG.info(f"[ARB BUY] sum={sum_ask}  profit={profit}  qty={qty}")
+                        self.pm_arb_busy = True
+                        for sym in config.PM_SYMS:
+                            await self._pm_place(sym, qty, Side.BUY, asks[sym], "arb")
+                        self.pm_arb_cooldown = config.PM_ARB_COOLDOWN
+                        return
+
+        if all(bids[s] for s in config.PM_SYMS):
+            if min(bids[s] for s in config.PM_SYMS) >= config.PM_ARB_SKIP_BELOW:
+                sum_bid = sum(bids[s] for s in config.PM_SYMS)
+                profit = sum_bid - config.PM_RESOLUTION
+                if profit >= config.PM_ARB_MIN_PROFIT:
+                    qty = min(config.PM_ARB_SIZE, min(config.PM_SOFT_LIMIT + pos[s] for s in config.PM_SYMS))
+                    if qty > 0:
+                        _PM_LOG.info(f"[ARB SELL] sum={sum_bid}  profit={profit}  qty={qty}")
+                        self.pm_arb_busy = True
+                        for sym in config.PM_SYMS:
+                            await self._pm_place(sym, qty, Side.SELL, bids[sym], "arb")
+                        self.pm_arb_cooldown = config.PM_ARB_COOLDOWN
+
+    # ========================================================================
+    # PM STRATEGY 2: CPI SWEEP (NEW from c-strat-krishi)
+    # ========================================================================
+
+    def _pm_adjust_qty_for_position(self, sym: str, base_qty: int, side: Side) -> int:
+        """Reduce size when adding to existing directional risk."""
+        pos = self._pm_pos(sym)
+        if side == Side.BUY and pos > 5:
+            return max(1, base_qty // 2)
+        if side == Side.SELL and pos < -5:
+            return max(1, base_qty // 2)
+        return base_qty
+
+    async def _pm_cpi_sweep(self, surprise: float):
+        magnitude = min(3.0, abs(surprise) / 0.001)
+        buy_qty = max(1, int(config.PM_CPI_BUY_BASE * magnitude))
+        sell_qty = max(1, int(config.PM_CPI_SELL_BASE * magnitude))
+        if surprise > 0:
+            buy_sym, sell_sym, label = "R_HIKE", "R_CUT", "HAWKISH"
+        else:
+            buy_sym, sell_sym, label = "R_CUT", "R_HIKE", "DOVISH"
+        _PM_LOG.info(f"[CPI {label}] surprise={surprise:+.5f}  "
+                     f"buy {buy_qty}x{buy_sym}  sell {sell_qty}x{sell_sym}")
+
+        buy_qty = self._pm_adjust_qty_for_position(buy_sym, buy_qty, Side.BUY)
+        sell_qty = self._pm_adjust_qty_for_position(sell_sym, sell_qty, Side.SELL)
+
+        ask = self._pm_best_ask(buy_sym)
+        if ask:
+            qty = min(buy_qty, config.PM_SOFT_LIMIT - self._pm_pos(buy_sym))
+            if qty > 0:
+                await self._pm_place(buy_sym, qty, Side.BUY, ask + 10, "cpi")
+                self.pm_news_traded_syms.add(buy_sym)
+        bid = self._pm_best_bid(sell_sym)
+        if bid:
+            qty = min(sell_qty, config.PM_SOFT_LIMIT + self._pm_pos(sell_sym))
+            if qty > 0:
+                await self._pm_place(sell_sym, qty, Side.SELL, max(1, bid - 10), "cpi")
+                self.pm_news_traded_syms.add(sell_sym)
+
+    # ========================================================================
+    # PM STRATEGY 3: NEWS SWEEP (NEW from c-strat-krishi)
+    # ========================================================================
+
+    def _pm_score_headline(self, text: str, msg_type: str = "") -> tuple[int, int]:
+        """Score headline for hawk/dove direction. Returns (direction, tier)."""
+        if _HAWK_T1.search(text): return +1, 1
+        if _DOVE_T1.search(text):
+            if _ANTI_DOVE.search(text):
+                return +1, 1
+            return -1, 1
+
+        h2, d2 = len(_HAWK_T2.findall(text)), len(_DOVE_T2.findall(text))
+        has_negation = bool(_NEGATION.search(text))
+        is_labor = bool(re.search(r"unemploy|jobless|hiring|payroll|jobs?\b|employment", text, re.IGNORECASE))
+
+        if h2 > 0 and has_negation and d2 == 0 and not is_labor:
+            d2 = h2
+            h2 = 0
+
+        if h2 > d2: return +1, 2
+        if d2 > h2: return -1, 2
+        if h2 > 0 and d2 > 0: return 0, 0
+
+        h3, d3 = len(_HAWK_T3.findall(text)), len(_DOVE_T3.findall(text))
+        if h3 > d3: return +1, 3
+        if d3 > h3: return -1, 3
+
+        return 0, 0
+
+    async def _pm_news_sweep(self, buy_sym: str, sell_sym: str, buy_qty: int, sell_qty: int, tag: str = "news"):
+        """Sweep PM book directionally."""
+        placed = []
+
+        buy_qty = self._pm_adjust_qty_for_position(buy_sym, buy_qty, Side.BUY)
+        sell_qty = self._pm_adjust_qty_for_position(sell_sym, sell_qty, Side.SELL)
+
+        ask = self._pm_best_ask(buy_sym)
+        if ask and buy_qty > 0:
+            qty = min(buy_qty, config.PM_SOFT_LIMIT - self._pm_pos(buy_sym))
+            if qty > 0:
+                oid = await self._pm_place(buy_sym, qty, Side.BUY, ask + 5, tag)
+                if oid:
+                    placed.append(f"BUY {qty}x{buy_sym}@{ask+5}")
+                    self.pm_news_traded_syms.add(buy_sym)
+        bid = self._pm_best_bid(sell_sym)
+        if bid and sell_qty > 0:
+            qty = min(sell_qty, config.PM_SOFT_LIMIT + self._pm_pos(sell_sym))
+            if qty > 0:
+                oid = await self._pm_place(sell_sym, qty, Side.SELL, max(1, bid - 5), tag)
+                if oid:
+                    placed.append(f"SELL {qty}x{sell_sym}@{max(1,bid-5)}")
+                    self.pm_news_traded_syms.add(sell_sym)
+        if placed:
+            _PM_LOG.info(f"[{tag.upper()} SWEEP] {', '.join(placed)}")
+
+    # ========================================================================
+    # PM STRATEGY 4: MARKET FOLLOW (NEW from c-strat-krishi)
+    # ========================================================================
+
+    def _pm_open_follow_window(self):
+        """Snapshot mids when news arrives for follow-the-leader."""
+        self.pm_follow_snapshot = {}
+        self.pm_news_traded_syms.clear()
+        for sym in config.PM_SYMS:
+            m = self._pm_mid(sym)
+            if m is not None:
+                self.pm_follow_snapshot[sym] = m
+        self.pm_follow_deadline = time.time() + config.PM_FOLLOW_WINDOW
+        self.pm_follow_fired = False
+
+    async def _pm_try_follow(self):
+        """Follow the first significant mover after news."""
+        if self.pm_follow_fired or not self.pm_follow_snapshot:
+            return
+        if time.time() > self.pm_follow_deadline:
+            self.pm_follow_fired = True
+            return
+
+        best_sym, best_delta = None, 0.0
+        for sym in config.PM_SYMS:
+            if sym in self.pm_news_traded_syms:
+                continue
+            m = self._pm_mid(sym)
+            if m is None or sym not in self.pm_follow_snapshot:
+                continue
+            delta = m - self.pm_follow_snapshot[sym]
+            if abs(delta) > abs(best_delta):
+                best_sym, best_delta = sym, delta
+
+        if best_sym is None or abs(best_delta) < config.PM_FOLLOW_THRESHOLD:
+            return
+
+        if best_delta > 0:
+            ask = self._pm_best_ask(best_sym)
+            if ask:
+                qty = min(config.PM_FOLLOW_QTY, config.PM_SOFT_LIMIT - self._pm_pos(best_sym))
+                if qty > 0:
+                    await self._pm_place(best_sym, qty, Side.BUY, ask + 3, "follow")
+                    _PM_LOG.info(f"[FOLLOW] BUY {qty}x{best_sym}@{ask+3} delta={best_delta:+.0f}")
+        else:
+            bid = self._pm_best_bid(best_sym)
+            if bid:
+                qty = min(config.PM_FOLLOW_QTY, config.PM_SOFT_LIMIT + self._pm_pos(best_sym))
+                if qty > 0:
+                    await self._pm_place(best_sym, qty, Side.SELL, max(1, bid - 3), "follow")
+                    _PM_LOG.info(f"[FOLLOW] SELL {qty}x{best_sym}@{max(1,bid-3)} delta={best_delta:+.0f}")
+
+        self.pm_follow_fired = True
+
+    # ========================================================================
+    # PM — STATUS HELPERS
+    # ========================================================================
+
+    def _pm_pos_str(self) -> str:
+        return (f"cut={self._pm_pos('R_CUT')} hold={self._pm_pos('R_HOLD')} "
+                f"hike={self._pm_pos('R_HIKE')}")
+
+    # ========================================================================
+    # MERGED EVENT HANDLERS
     # ========================================================================
 
     async def bot_handle_book_update(self, symbol: str):
         """
-        Hook for book updates.
+        Merged book update handler for BOTH strategies.
 
-        Triggers:
-        - Mid price tracking (for calibration averaging)
-        - Sniping logic (if sniping mode active)
-        - News exit check (if post-news mode active)
+        Stock A: mid tracking, sniping, news exit check
+        Prediction Market: follow window, sum arb check
         """
-        if symbol != "A":
-            return
+        # ── Stock A logic (PRESERVED) ─────────────────────────────────────────
+        if symbol == "A":
+            current_mid = self._get_current_mid_a()
+            if current_mid is not None:
+                self.recent_mids_a.append((time.time(), current_mid))
 
-        # Track mid price for calibration averaging
-        current_mid = self._get_current_mid_a()
-        if current_mid is not None:
-            self.recent_mids_a.append((time.time(), current_mid))
+            if self.sniping_mode_active:
+                await self.snipe_on_book_update()
 
-        # Sniping mode hook
-        if self.sniping_mode_active:
-            await self.snipe_on_book_update()
+            if self.post_news_mode_until is not None and time.time() < self.post_news_mode_until:
+                await self.check_news_exit()
 
-        # News exit check
-        if self.post_news_mode_until is not None and time.time() < self.post_news_mode_until:
-            await self.check_news_exit()
+        # ── Prediction Market logic (NEW) ─────────────────────────────────────
+        if symbol in config.PM_SYMS:
+            if not self.pm_follow_fired:
+                await self._pm_try_follow()
+            if not self.pm_arb_busy:
+                await self._pm_check_sum_arb()
 
     async def bot_handle_order_fill(self, order_id: str, qty: int, price: int):
-        """Log fills with edge calculation."""
+        """Merged fill handler for both strategies."""
         info = self.open_orders.get(order_id)
-        if info:
-            symbol = info[0].symbol
-            side = "BUY" if info[0].side == 1 else "SELL"
+        oid = str(order_id)
 
-            if symbol == "A" and self.current_eps_a is not None:
-                fair = self.fair_value.fair_value_a(self.current_eps_a)
-                if fair:
-                    edge = (fair - price) if side == "BUY" else (price - fair)
-                    print(f"[FILL] {symbol} {side} {qty}@{price} | fair={fair:.0f} | edge={edge:.0f}")
+        if not info:
+            return
+
+        symbol = info[0].symbol
+        side = "BUY" if info[0].side == 1 else "SELL"
+
+        # ── Stock A fill logging (PRESERVED) ──────────────────────────────────
+        if symbol == "A" and self.current_eps_a is not None:
+            fair = self.fair_value.fair_value_a(self.current_eps_a)
+            if fair:
+                edge = (fair - price) if side == "BUY" else (price - fair)
+                print(f"[FILL] {symbol} {side} {qty}@{price} | fair={fair:.0f} | edge={edge:.0f}")
+
+        # ── PM fill tracking (NEW) ────────────────────────────────────────────
+        if symbol in config.PM_SYMS:
+            tag = self.pm_fill_source.get(oid, "?")
+
+            if oid in self.pm_arb_pending:
+                remaining = info[1] - qty if info else 0
+                if remaining <= 0:
+                    self.pm_arb_pending.discard(oid)
+                    self.pm_fill_source.pop(oid, None)
+                if not self.pm_arb_pending:
+                    self.pm_arb_busy = False
+            else:
+                self.pm_fill_source.pop(oid, None)
+
+            signed = -price * qty if side == "BUY" else price * qty
+            if tag in self.pm_pnl:
+                self.pm_pnl[tag] += signed
+            self.pm_pnl["total"] += signed
+            _PM_LOG.info(f"[FILL] {tag}  {symbol} {side} {qty}@{price}  pos={self._pm_pos(symbol)}  "
+                         f"${self.pm_pnl['total']:+d}")
+
+    async def bot_handle_trade_msg(self, symbol: str, price: int, qty: int):
+        """Check for PM arb opportunities on public trades."""
+        if symbol in config.PM_SYMS and not self.pm_arb_busy:
+            await self._pm_check_sum_arb()
+
+    async def bot_handle_order_rejected(self, order_id: str, reason: str):
+        oid = str(order_id)
+        self.pm_fill_source.pop(oid, None)
+        self.pm_arb_pending.discard(oid)
+        _PM_LOG.warning(f"[REJECTED] {order_id}: {reason}")
+
+    async def bot_handle_cancel_response(self, order_id: str, success: bool, error: Optional[str] = None):
+        if success:
+            oid = str(order_id)
+            self.pm_fill_source.pop(oid, None)
+            self.pm_arb_pending.discard(oid)
 
     async def bot_handle_news(self, news_release: dict):
         """
-        Handle all news events.
+        Merged news handler for BOTH strategies.
 
-        Routes to appropriate handlers:
-        - A earnings → handle_a_earnings
-        - A-symbol unstructured → sentiment classifier → handle_a_news_trade
-        - C news → COMMENTED OUT
-        - Macro news → ignored for A
+        Routing:
+        - A earnings → Stock A handler (PRESERVED)
+        - CPI print → PM CPI sweep (NEW)
+        - A-symbol unstructured → Stock A sentiment classifier (PRESERVED)
+        - Non-A unstructured → PM headline classifier (NEW)
+        - All news → PM follow window (NEW)
         """
         news_type = news_release["kind"]
         news_data = news_release["new_data"]
         tick = news_release["tick"]
+
+        # ── PM: open follow window on EVERY news event ────────────────────────
+        self._pm_open_follow_window()
+        self.pm_current_tick = max(self.pm_current_tick, tick)
 
         if news_type == "structured":
             subtype = news_data.get("structured_subtype")
@@ -613,55 +1049,86 @@ class MyXchangeClient(XChangeClient):
                 asset = news_data.get("asset")
                 eps = news_data.get("value")
 
+                # ── Stock A earnings (PRESERVED) ──────────────────────────────
                 if asset == "A":
                     await self.handle_a_earnings(eps, tick)
 
-                # C earnings COMMENTED OUT
-                # elif asset == "C":
-                #     ...
-
-            # CPI COMMENTED OUT
-            # elif subtype == "cpi_print":
-            #     ...
+            elif subtype == "cpi_print":
+                # ── PM CPI sweep (NEW) ────────────────────────────────────────
+                forecast = float(news_data.get("forecast", 0))
+                actual = float(news_data.get("actual", 0))
+                surprise = actual - forecast
+                _PM_LOG.info(f"[CPI] actual={actual:.5f}  forecast={forecast:.5f}  "
+                             f"surprise={surprise:+.5f}")
+                if abs(surprise) >= config.PM_CPI_MIN_SURPRISE:
+                    await self._pm_cpi_sweep(surprise)
+                    await self._pm_check_sum_arb()
 
         else:
             # Unstructured news
             symbol = news_release.get("symbol")
             content = news_data.get("content", "")
 
-            # Only process A-symbol news
+            # ── Stock A news (PRESERVED) ──────────────────────────────────────
             if symbol == "A":
-                # Track for contamination
                 self.recent_a_news.append((tick, "news"))
 
-                # Classify sentiment - pass properly structured dict
                 news_for_classifier = {"symbol": symbol, "content": content}
                 sentiment, confidence = self.sentiment.classify(news_for_classifier)
 
                 print(f"\n[NEWS] A-symbol: {content[:60]}...")
                 print(f"[NEWS] Sentiment: {sentiment}, confidence: {confidence:.2f}")
 
-                # Track last sentiment for earnings prediction
                 if sentiment in ["bullish", "bearish"]:
                     self.last_a_news_sentiment = sentiment
                     print(f"[NEWS] Updated last sentiment: {sentiment}")
 
-                # Trade on any directional signal (bullish or bearish)
                 if sentiment in ["bullish", "bearish"]:
                     await self.handle_a_news_trade(sentiment, confidence, content)
                 else:
                     print(f"[NEWS] Low confidence or neutral, not trading")
 
-            # Macro news (no symbol) → ignore for A
-            elif symbol is None:
-                print(f"[NEWS] Macro news (no symbol), ignoring for A")
+            # ── PM unstructured news (NEW) ────────────────────────────────────
+            # Process ALL unstructured news for PM (not just non-A)
+            if content.strip():
+                msg_type = news_data.get("type", "") if isinstance(news_data, dict) else ""
+                direction, tier = self._pm_score_headline(content, msg_type)
+
+                if msg_type == "FedSpeak" and direction != 0 and tier > 1:
+                    tier = max(1, tier - 1)
+
+                _PM_LOG.info(f"[NEWS] type={msg_type!r}  tier={tier}  dir={direction:+d}  {content[:120]}")
+                if direction != 0 and tier != 0:
+                    buy_qty = config.PM_NEWS_BUY_SIZE[tier]
+                    sell_qty = config.PM_NEWS_SELL_SIZE[tier]
+                    if direction > 0:
+                        buy_sym, sell_sym = "R_HIKE", "R_CUT"
+                    else:
+                        buy_sym, sell_sym = "R_CUT", "R_HIKE"
+                    if buy_qty > 0:
+                        await self._pm_news_sweep(buy_sym, sell_sym, buy_qty, sell_qty)
+                    await self._pm_check_sum_arb()
+
+    async def bot_handle_market_resolved(self, market_id: str, winning_symbol: str, tick: int):
+        _PM_LOG.info(f"[RESOLVED] {market_id} → {winning_symbol}")
+        _PM_LOG.info(f"[FINAL POS] {self._pm_pos_str()}")
+        _PM_LOG.info(f"[PNL] arb={self.pm_pnl['arb']:+d}  cpi={self.pm_pnl['cpi']:+d}  "
+                     f"news={self.pm_pnl['news']:+d}  follow={self.pm_pnl['follow']:+d}  "
+                     f"total={self.pm_pnl['total']:+d}")
+
+    async def bot_handle_settlement_payout(self, user: str, market_id: str, amount: int, tick: int):
+        _PM_LOG.info(f"[PAYOUT] {market_id}: {amount}")
+
+    # ========================================================================
+    # MERGED TRADE LOOPS
+    # ========================================================================
 
     async def trade_loop(self):
         """
-        Periodic trading loop for passive quoting.
+        Stock A periodic trading loop (PRESERVED).
 
         Only quotes when:
-        - Calibrated (≥3 samples)
+        - Calibrated (>=3 samples)
         - Not in sniping mode
         - Not in post-news mode
         """
@@ -696,6 +1163,52 @@ class MyXchangeClient(XChangeClient):
             mtm = cash + pos_a * fair
             print(f"[PNL] cash={cash} | pos_A={pos_a} | fair_A={fair:.0f} | mtm={mtm:.0f}")
 
+    async def pm_trade_loop(self):
+        """
+        Prediction Market periodic loop (NEW from c-strat-krishi).
+
+        Handles:
+        - Stale directional order cancellation
+        - Arb housekeeping
+        - Periodic arb checks
+        - Status logging
+        """
+        await asyncio.sleep(2)
+        _PM_LOG.info(f"[PM] Trade loop started. Books: {list(self.order_books.keys())}")
+
+        while True:
+            await asyncio.sleep(config.PM_TRADE_INTERVAL)
+            self.pm_loop_count += 1
+            try:
+                if self.pm_directional_orders:
+                    await self._pm_cancel_stale_directional()
+
+                if self.pm_arb_busy and self.pm_loop_count % 3 == 0:
+                    await self._pm_cancel_arb()
+
+                await self._pm_check_sum_arb()
+
+                # Status log every 30 loops (~15s)
+                if self.pm_loop_count % 30 == 0:
+                    pm_mids = {s: self._pm_mid(s) for s in config.PM_SYMS}
+                    mid_str = "  ".join(
+                        f"{s}={pm_mids[s]:.0f}" if pm_mids[s] else f"{s}=?" for s in config.PM_SYMS)
+                    mtm = sum(self._pm_pos(s) * (pm_mids[s] or 0) for s in config.PM_SYMS)
+                    _PM_LOG.info(
+                        f"[STATUS] tick={self.pm_current_tick}  {self._pm_pos_str()}  "
+                        f"mids: {mid_str}  "
+                        f"arb={self.pm_pnl['arb']:+d}  cpi={self.pm_pnl['cpi']:+d}  "
+                        f"news={self.pm_pnl['news']:+d}  follow={self.pm_pnl['follow']:+d}  "
+                        f"cash={self.pm_pnl['total']:+d}  mtm={mtm:+.0f}"
+                    )
+
+            except Exception as e:
+                _PM_LOG.error(f"[LOOP ERR] {e}", exc_info=True)
+
+    # ========================================================================
+    # CONNECTION & STARTUP
+    # ========================================================================
+
     async def process_message(self, msg) -> None:
         """
         Override parent's process_message to handle EOF gracefully.
@@ -709,8 +1222,10 @@ class MyXchangeClient(XChangeClient):
         await super().process_message(msg)
 
     async def start(self):
-        """Start bot with trade loop and automatic reconnection."""
+        """Start bot with BOTH trade loops and automatic reconnection."""
+        # Launch both trade loops as independent tasks
         asyncio.create_task(self.trade_loop())
+        asyncio.create_task(self.pm_trade_loop())
 
         # Reconnection loop with exponential backoff
         backoff_s = 1.0
@@ -755,6 +1270,11 @@ class MyXchangeClient(XChangeClient):
 
 
 async def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
     my_client = MyXchangeClient(
         "practice.uchicago.exchange:3333",
         "maryland_uiuc",

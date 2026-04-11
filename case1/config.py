@@ -1,5 +1,6 @@
-# Stock A Configuration
-# Updated per case1_stock_a_update_v2.md empirical findings
+# Configuration for merged Stock A + Prediction Market bot
+# Stock A: Updated per case1_stock_a_update_v2.md empirical findings
+# Prediction Market: Sum arb + CPI sweep + news sweep + market follow
 
 PARAMS = {
     "A": {
@@ -86,3 +87,38 @@ POST_NEWS_MODE_S = 10
 # Exit threshold: close position once mid moves this far in our direction
 # Compromise between original (80) and empirical avg (55)
 NEWS_EXIT_MOVE_THRESHOLD = 70
+
+
+# ============================================================================
+# PREDICTION MARKET PARAMETERS (from c-strat-krishi)
+# ============================================================================
+
+PM_SYMS = ["R_CUT", "R_HOLD", "R_HIKE"]
+PM_RESOLUTION = 1000   # payout on winning contract
+
+# ── Sum Arb ───────────────────────────────────────────────────────────────────
+PM_ARB_MIN_PROFIT = 4
+PM_ARB_SIZE       = 5
+PM_ARB_COOLDOWN   = 5
+PM_ARB_SKIP_BELOW = 30   # skip arb if any leg's best price < this
+PM_ARB_MAX_NET    = 10   # max net position from arb across all contracts
+
+# ── CPI sweep ─────────────────────────────────────────────────────────────────
+PM_CPI_BUY_BASE     = 15
+PM_CPI_SELL_BASE    = 10
+PM_CPI_MIN_SURPRISE = 0.0001
+
+# ── News sweep ────────────────────────────────────────────────────────────────
+PM_NEWS_BUY_SIZE  = {1: 12, 2: 6, 3: 0}
+PM_NEWS_SELL_SIZE = {1: 8,  2: 4, 3: 0}
+
+# ── Market-follow after news ──────────────────────────────────────────────────
+PM_FOLLOW_WINDOW    = 0.6   # seconds to watch after news
+PM_FOLLOW_THRESHOLD = 8     # min pts a contract must move to trigger
+PM_FOLLOW_QTY       = 6     # contracts per follow trade
+
+# ── Position management ──────────────────────────────────────────────────────
+PM_SOFT_LIMIT = 25   # max |position| per PM contract
+
+# ── PM trade loop cadence ─────────────────────────────────────────────────────
+PM_TRADE_INTERVAL = 0.5
